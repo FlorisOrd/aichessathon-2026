@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import random
 import subprocess
@@ -18,7 +19,7 @@ from harness.referee import FAILED_TERMINATIONS, Outcome, Result, play_match
 from harness.sandbox import local
 
 SCHEMA = "aichessathon.arena-suite"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_BASE_MS = 5_000
 DEFAULT_INCREMENT_MS = 100
 DEFAULT_PLY_CAP = 120
@@ -43,6 +44,12 @@ class Position:
 
 
 @dataclass(frozen=True)
+class PositionSuite:
+    positions: list[Position]
+    sha256: str
+
+
+@dataclass(frozen=True)
 class Configuration:
     candidate: Path
     opponent: Path
@@ -62,12 +69,14 @@ class Configuration:
 class AgentMetadata:
     path: str
     git_commit: str | None
+    git_dirty: bool | None
 
 
 @dataclass(frozen=True)
 class SuiteMetadata:
     path: str
     positions: int
+    sha256: str
 
 
 @dataclass(frozen=True)
@@ -203,11 +212,15 @@ def configuration_from(arguments: argparse.Namespace) -> Configuration:
     )
 
 
-def load_positions(path: Path) -> list[Position]:
+def load_positions(path: Path) -> PositionSuite:
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        content = path.read_bytes()
     except OSError as error:
         raise ArenaSuiteError(f"cannot read position suite {path}: {error}") from error
+    try:
+        lines = content.decode("utf-8").splitlines()
+    except UnicodeDecodeError as error:
+        raise ArenaSuiteError(f"position suite {path} is not valid UTF-8: {error}") from error
 
     positions: list[Position] = []
     for source_line, raw_line in enumerate(lines, start=1):
@@ -228,11 +241,11 @@ def load_positions(path: Path) -> list[Position]:
 
     if not positions:
         raise ArenaSuiteError(f"position suite {path} contains no FEN positions")
-    return positions
+    return PositionSuite(positions=positions, sha256=hashlib.sha256(content).hexdigest())
 
 
-def run_experiment(configuration: Configuration, positions: list[Position]) -> RunArtifacts:
-    ordered_positions = list(positions)
+def run_experiment(configuration: Configuration, suite: PositionSuite) -> RunArtifacts:
+    ordered_positions = list(suite.positions)
     if configuration.shuffle:
         random.Random(configuration.seed).shuffle(ordered_positions)
 
@@ -295,7 +308,7 @@ def run_experiment(configuration: Configuration, positions: list[Position]) -> R
     elapsed_seconds = time.monotonic() - started_at
     result = _build_result(
         configuration,
-        positions,
+        suite,
         games,
         planned_games,
         timestamp,
@@ -306,7 +319,7 @@ def run_experiment(configuration: Configuration, positions: list[Position]) -> R
 
 def _build_result(
     configuration: Configuration,
-    positions: list[Position],
+    suite: PositionSuite,
     games: list[GameRecord],
     planned_games: int,
     timestamp: str,
@@ -326,17 +339,12 @@ def _build_result(
         schema=SCHEMA,
         schema_version=SCHEMA_VERSION,
         timestamp_utc=timestamp,
-        candidate=AgentMetadata(
-            path=str(configuration.candidate),
-            git_commit=_git_commit(configuration.candidate),
-        ),
-        opponent=AgentMetadata(
-            path=str(configuration.opponent),
-            git_commit=_git_commit(configuration.opponent),
-        ),
+        candidate=_git_metadata(configuration.candidate),
+        opponent=_git_metadata(configuration.opponent),
         position_suite=SuiteMetadata(
             path=str(configuration.position_suite),
-            positions=len(positions),
+            positions=len(suite.positions),
+            sha256=suite.sha256,
         ),
         configuration=ExperimentConfiguration(
             seed=configuration.seed,
@@ -443,10 +451,27 @@ def _write_text(path: Path, content: str) -> None:
         raise ArenaSuiteError(f"cannot write {path}: {error}") from error
 
 
-def _git_commit(directory: Path) -> str | None:
+def _git_metadata(directory: Path) -> AgentMetadata:
+    inside_worktree = _run_git(directory, "rev-parse", "--is-inside-work-tree")
+    if inside_worktree is None or inside_worktree.stdout.strip() != "true":
+        return AgentMetadata(path=str(directory), git_commit=None, git_dirty=None)
+
+    commit_result = _run_git(directory, "rev-parse", "--verify", "HEAD")
+    status_result = _run_git(
+        directory,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+    )
+    commit = commit_result.stdout.strip() if commit_result is not None else None
+    dirty = bool(status_result.stdout) if status_result is not None else None
+    return AgentMetadata(path=str(directory), git_commit=commit or None, git_dirty=dirty)
+
+
+def _run_git(directory: Path, *arguments: str) -> subprocess.CompletedProcess[str] | None:
     try:
         completed: subprocess.CompletedProcess[str] = subprocess.run(
-            ["git", "-C", str(directory), "rev-parse", "HEAD"],
+            ["git", "-C", str(directory), *arguments],
             check=False,
             capture_output=True,
             text=True,
@@ -454,16 +479,15 @@ def _git_commit(directory: Path) -> str | None:
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
-    commit = completed.stdout.strip()
-    return commit if completed.returncode == 0 and commit else None
+    return completed if completed.returncode == 0 else None
 
 
 def main() -> None:
     parser = build_parser()
     try:
         configuration = configuration_from(parser.parse_args())
-        positions = load_positions(configuration.position_suite)
-        artifacts = run_experiment(configuration, positions)
+        suite = load_positions(configuration.position_suite)
+        artifacts = run_experiment(configuration, suite)
         print_summary(artifacts.result)
         write_outputs(configuration, artifacts)
     except ArenaSuiteError as error:
