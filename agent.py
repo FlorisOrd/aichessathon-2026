@@ -31,7 +31,10 @@ def get_move(fen: str, time_left_ms: int) -> str:
     print(
         f"move={move.uci()} depth={result.completed_depth} score={result.score} "
         f"nodes={result.nodes} elapsed_ms={result.elapsed_ms:.1f} "
-        f"timeout={'yes' if result.timed_out else 'no'}",
+        f"timeout={'yes' if result.timed_out else 'no'} "
+        f"tt_probes={result.tt_probes} tt_hits={result.tt_hits} "
+        f"tt_usable={result.tt_usable_hits} tt_cutoffs={result.tt_cutoffs} "
+        f"tt_stores={result.tt_stores} tt_hit_rate={result.tt_hit_rate:.1%}",
         flush=True,
     )
     return move.uci()

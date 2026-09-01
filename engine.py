@@ -8,11 +8,14 @@ history cannot; this engine deliberately does not invent missing repetition stat
 
 from __future__ import annotations
 
+import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import IntEnum
 
 import chess
+import chess.polyglot
 
 MATE_SCORE = 1_000_000
 MATE_THRESHOLD = MATE_SCORE - 10_000
@@ -23,6 +26,8 @@ MAX_SOFT_TIME_MS = 1_500
 TIME_DIVISOR = 40
 MAX_RESERVE_MS = 2_000
 MIN_THREEFOLD_CLAIM_PLIES = 7
+DEFAULT_TT_CAPACITY = 1 << 16
+_TT_INDEX_MIX = 0x9E3779B97F4A7C15
 
 PIECE_TYPES: tuple[chess.PieceType, ...] = (
     chess.PAWN,
@@ -76,6 +81,158 @@ class SearchResult:
     nodes: int
     elapsed_ms: float
     timed_out: bool
+    tt_probes: int
+    tt_hits: int
+    tt_usable_hits: int
+    tt_cutoffs: int
+    tt_stores: int
+
+    @property
+    def tt_hit_rate(self) -> float:
+        """Return raw TT hits per probe; zero when no probes were made."""
+        return self.tt_hits / self.tt_probes if self.tt_probes else 0.0
+
+
+class BoundType(IntEnum):
+    """How a stored fail-soft score relates to its original alpha-beta window."""
+
+    EXACT = 0
+    LOWER = 1
+    UPPER = 2
+
+
+@dataclass(frozen=True, slots=True)
+class TTEntry:
+    """One direct-mapped transposition-table entry."""
+
+    position_key: int
+    halfmove_clock: int
+    depth: int
+    score: int
+    bound: BoundType
+    best_move: chess.Move | None
+    generation: int
+
+
+@dataclass
+class TTStats:
+    probes: int = 0
+    hits: int = 0
+    usable_hits: int = 0
+    cutoffs: int = 0
+    stores: int = 0
+
+
+def position_key(board: chess.Board) -> int:
+    """Return python-chess's documented Polyglot Zobrist key for ``board``."""
+    return chess.polyglot.zobrist_hash(board)
+
+
+def score_to_tt(score: int, ply_from_root: int) -> int:
+    """Remove root-relative mate distance before storing a score."""
+    if score >= MATE_THRESHOLD:
+        return score + ply_from_root
+    if score <= -MATE_THRESHOLD:
+        return score - ply_from_root
+    return score
+
+
+def score_from_tt(score: int, ply_from_root: int) -> int:
+    """Restore root-relative mate distance after loading a score."""
+    if score >= MATE_THRESHOLD:
+        return score - ply_from_root
+    if score <= -MATE_THRESHOLD:
+        return score + ply_from_root
+    return score
+
+
+class TranspositionTable:
+    """Fixed-capacity direct-mapped table with depth-preferred replacement."""
+
+    def __init__(self, capacity: int = DEFAULT_TT_CAPACITY) -> None:
+        if capacity < 1 or capacity & (capacity - 1):
+            raise ValueError("TT capacity must be a positive power of two")
+        self.capacity = capacity
+        self._mask = capacity - 1
+        self._entries: list[TTEntry | None] = [None] * capacity
+        self.generation = 0
+
+    def new_generation(self) -> None:
+        """Age collision entries without clearing the fixed-size allocation."""
+        self.generation += 1
+
+    def probe(self, board: chess.Board) -> TTEntry | None:
+        """Return the matching entry, verifying key and halfmove clock after indexing."""
+        key = position_key(board)
+        entry = self._entries[self._index(key, board.halfmove_clock)]
+        if (
+            entry is not None
+            and entry.position_key == key
+            and entry.halfmove_clock == board.halfmove_clock
+        ):
+            return entry
+        return None
+
+    def store(
+        self,
+        board: chess.Board,
+        depth: int,
+        score: int,
+        bound: BoundType,
+        best_move: chess.Move | None,
+        ply_from_root: int,
+    ) -> bool:
+        """Store an entry when the direct-mapped replacement policy accepts it."""
+        key = position_key(board)
+        index = self._index(key, board.halfmove_clock)
+        current = self._entries[index]
+        same_position = (
+            current is not None
+            and current.position_key == key
+            and current.halfmove_clock == board.halfmove_clock
+        )
+        should_replace = (
+            current is None
+            or (same_position and depth >= current.depth)
+            or (
+                not same_position
+                and (current.generation != self.generation or depth >= current.depth)
+            )
+        )
+        if not should_replace:
+            return False
+        self._entries[index] = TTEntry(
+            position_key=key,
+            halfmove_clock=board.halfmove_clock,
+            depth=depth,
+            score=score_to_tt(score, ply_from_root),
+            bound=bound,
+            best_move=best_move,
+            generation=self.generation,
+        )
+        return True
+
+    def clear(self) -> None:
+        """Clear entries while retaining the same bounded allocation."""
+        self._entries[:] = [None] * self.capacity
+
+    @property
+    def entry_count(self) -> int:
+        return sum(entry is not None for entry in self._entries)
+
+    @property
+    def approximate_max_bytes(self) -> int:
+        """Conservatively estimate a fully populated table's Python heap footprint."""
+        sample = TTEntry(0, 0, 0, 0, BoundType.EXACT, chess.Move.null(), 0)
+        referenced_values = 5 * sys.getsizeof(0) + sys.getsizeof(chess.Move.null())
+        return sys.getsizeof(self._entries) + self.capacity * (
+            sys.getsizeof(sample) + referenced_values
+        )
+
+    def _index(self, key: int, halfmove_clock: int) -> int:
+        mixed = key ^ ((halfmove_clock + 1) * _TT_INDEX_MIX)
+        mixed ^= mixed >> 32
+        return mixed & self._mask
 
 
 def _centrality(square: chess.Square) -> int:
@@ -182,9 +339,18 @@ def move_order_score(board: chess.Board, move: chess.Move) -> int:
     return score
 
 
-def ordered_moves(board: chess.Board) -> list[chess.Move]:
-    """Return legal moves in a deterministic, replaceable first-pass order."""
-    return sorted(board.legal_moves, key=lambda move: (-move_order_score(board, move), move.uci()))
+def ordered_moves(
+    board: chess.Board, tt_move: chess.Move | None = None
+) -> list[chess.Move]:
+    """Return deterministic tactical ordering, with a legal TT move first."""
+    moves = sorted(
+        board.legal_moves,
+        key=lambda move: (-move_order_score(board, move), move.uci()),
+    )
+    if tt_move is not None and tt_move in moves:
+        moves.remove(tt_move)
+        moves.insert(0, tt_move)
+    return moves
 
 
 def allocate_time(time_left_ms: int) -> TimeBudget:
@@ -204,16 +370,23 @@ def allocate_time(time_left_ms: int) -> TimeBudget:
 
 
 class SearchEngine:
-    """Stateful only for one search; the reference engine intentionally has no cache."""
+    """Iterative-deepening alpha-beta search with a bounded transposition table."""
 
-    def __init__(self, clock_ns: Callable[[], int] = time.monotonic_ns) -> None:
+    def __init__(
+        self,
+        clock_ns: Callable[[], int] = time.monotonic_ns,
+        tt_capacity: int = DEFAULT_TT_CAPACITY,
+    ) -> None:
         self._clock_ns = clock_ns
         self._deadline_ns: int | None = None
         self._nodes = 0
+        self.table = TranspositionTable(tt_capacity)
+        self._tt_stats = TTStats()
 
     def search(self, board: chess.Board, time_left_ms: int) -> SearchResult:
         """Search until the soft/hard budget and return the last completed iteration."""
         self._deadline_ns = None
+        self._start_tt_generation()
         started_ns = self._clock_ns()
         moves = ordered_moves(board)
         root_terminal = terminal_score(board, 0)
@@ -225,6 +398,7 @@ class SearchEngine:
                 nodes=0,
                 elapsed_ms=self._elapsed_ms(started_ns),
                 timed_out=False,
+                **self._tt_result_fields(),
             )
 
         best_move = moves[0]
@@ -241,6 +415,7 @@ class SearchEngine:
                 nodes=0,
                 elapsed_ms=self._elapsed_ms(started_ns),
                 timed_out=False,
+                **self._tt_result_fields(),
             )
 
         soft_deadline_ns = started_ns + budget.soft_ms * 1_000_000
@@ -270,6 +445,7 @@ class SearchEngine:
             nodes=self._nodes,
             elapsed_ms=self._elapsed_ms(started_ns),
             timed_out=timed_out,
+            **self._tt_result_fields(),
         )
 
     def search_fixed_depth(self, board: chess.Board, depth: int) -> SearchResult:
@@ -279,6 +455,7 @@ class SearchEngine:
         started_ns = self._clock_ns()
         self._nodes = 0
         self._deadline_ns = None
+        self._start_tt_generation()
         move, score = self._search_depth(board, depth)
         return SearchResult(
             move=move,
@@ -287,6 +464,7 @@ class SearchEngine:
             nodes=self._nodes,
             elapsed_ms=self._elapsed_ms(started_ns),
             timed_out=False,
+            **self._tt_result_fields(),
         )
 
     def _search_depth(self, board: chess.Board, depth: int) -> tuple[chess.Move | None, int]:
@@ -295,19 +473,41 @@ class SearchEngine:
         if terminal is not None:
             return None, terminal
 
+        original_alpha = -INFINITY
+        original_beta = INFINITY
+        entry, alpha, beta, cached_score = self._probe_tt(
+            board,
+            depth,
+            original_alpha,
+            original_beta,
+            0,
+        )
+        tt_move = entry.best_move if entry is not None else None
+        if cached_score is not None and tt_move is not None and tt_move in board.legal_moves:
+            return tt_move, cached_score
+
         best_move: chess.Move | None = None
         best_score = -INFINITY
-        alpha = -INFINITY
-        for move in ordered_moves(board):
+        for move in ordered_moves(board, tt_move):
             board.push(move)
             try:
-                score = -self._negamax(board, depth - 1, -INFINITY, -alpha, 1)
+                score = -self._negamax(board, depth - 1, -beta, -alpha, 1)
             finally:
                 board.pop()
             if score > best_score:
                 best_score = score
                 best_move = move
             alpha = max(alpha, score)
+            if alpha >= beta:
+                break
+        self._store_tt(
+            board,
+            depth,
+            best_score,
+            self._bound_type(best_score, original_alpha, original_beta),
+            best_move,
+            0,
+        )
         return best_move, best_score
 
     def _negamax(
@@ -325,8 +525,22 @@ class SearchEngine:
         if depth == 0:
             return evaluate(board)
 
+        original_alpha = alpha
+        original_beta = beta
+        entry, alpha, beta, cached_score = self._probe_tt(
+            board,
+            depth,
+            alpha,
+            beta,
+            ply_from_root,
+        )
+        if cached_score is not None:
+            return cached_score
+
+        tt_move = entry.best_move if entry is not None else None
         best_score = -INFINITY
-        for move in ordered_moves(board):
+        best_move: chess.Move | None = None
+        for move in ordered_moves(board, tt_move):
             board.push(move)
             try:
                 score = -self._negamax(
@@ -338,11 +552,89 @@ class SearchEngine:
                 )
             finally:
                 board.pop()
-            best_score = max(best_score, score)
+            if score > best_score:
+                best_score = score
+                best_move = move
             alpha = max(alpha, score)
             if alpha >= beta:
                 break
+        self._store_tt(
+            board,
+            depth,
+            best_score,
+            self._bound_type(best_score, original_alpha, original_beta),
+            best_move,
+            ply_from_root,
+        )
         return best_score
+
+    def _start_tt_generation(self) -> None:
+        self.table.new_generation()
+        self._tt_stats = TTStats()
+
+    def _probe_tt(
+        self,
+        board: chess.Board,
+        depth: int,
+        alpha: int,
+        beta: int,
+        ply_from_root: int,
+    ) -> tuple[TTEntry | None, int, int, int | None]:
+        """Probe and apply a draw-safe entry to the current alpha-beta window."""
+        self._tt_stats.probes += 1
+        entry = self.table.probe(board)
+        if entry is None:
+            return None, alpha, beta, None
+        self._tt_stats.hits += 1
+
+        # A zero halfmove clock follows a capture or pawn move. Both are irreversible, so no
+        # position before that reset can recur and contribute to a future repetition claim.
+        # At every history-sensitive node we use only the legal move hint, never the value.
+        if board.halfmove_clock != 0 or entry.depth < depth:
+            return entry, alpha, beta, None
+
+        self._tt_stats.usable_hits += 1
+        score = score_from_tt(entry.score, ply_from_root)
+        if entry.bound == BoundType.EXACT:
+            self._tt_stats.cutoffs += 1
+            return entry, alpha, beta, score
+        if entry.bound == BoundType.LOWER:
+            alpha = max(alpha, score)
+        else:
+            beta = min(beta, score)
+        if alpha >= beta:
+            self._tt_stats.cutoffs += 1
+            return entry, alpha, beta, score
+        return entry, alpha, beta, None
+
+    def _store_tt(
+        self,
+        board: chess.Board,
+        depth: int,
+        score: int,
+        bound: BoundType,
+        best_move: chess.Move | None,
+        ply_from_root: int,
+    ) -> None:
+        if self.table.store(board, depth, score, bound, best_move, ply_from_root):
+            self._tt_stats.stores += 1
+
+    @staticmethod
+    def _bound_type(score: int, alpha: int, beta: int) -> BoundType:
+        if score <= alpha:
+            return BoundType.UPPER
+        if score >= beta:
+            return BoundType.LOWER
+        return BoundType.EXACT
+
+    def _tt_result_fields(self) -> dict[str, int]:
+        return {
+            "tt_probes": self._tt_stats.probes,
+            "tt_hits": self._tt_stats.hits,
+            "tt_usable_hits": self._tt_stats.usable_hits,
+            "tt_cutoffs": self._tt_stats.cutoffs,
+            "tt_stores": self._tt_stats.stores,
+        }
 
     def _visit_node(self) -> None:
         self._nodes += 1
