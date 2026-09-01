@@ -23,6 +23,14 @@ class TickingClock:
         return self.value
 
 
+class ExplodingSearchEngine(SearchEngine):
+    def _search_depth(self, board: chess.Board, depth: int) -> tuple[chess.Move | None, int]:
+        raise RuntimeError("deliberate test failure")
+
+    def deadline_is_clear(self) -> bool:
+        return self._deadline_ns is None
+
+
 class EvaluationTests(unittest.TestCase):
     def test_evaluation_uses_side_to_move_perspective(self) -> None:
         board = chess.Board("k7/8/8/8/8/8/4Q3/4K3 w - - 0 1")
@@ -60,6 +68,33 @@ class SearchTests(unittest.TestCase):
         board = chess.Board("8/8/8/8/8/4k3/8/4K3 w - - 0 1")
         self.assertEqual(terminal_score(board, 0), 0)
 
+    def test_fifty_move_claim_includes_claim_by_next_move(self) -> None:
+        claimable = chess.Board("4k3/8/8/8/8/8/R7/4K3 w - - 99 1")
+        nearby = chess.Board("4k3/8/8/8/8/8/R7/4K3 w - - 98 1")
+        claim = claimable.outcome(claim_draw=True)
+        self.assertIsNotNone(claim)
+        assert claim is not None
+        self.assertEqual(claim.termination, chess.Termination.FIFTY_MOVES)
+        self.assertEqual(terminal_score(claimable, 0), 0)
+        self.assertIsNone(nearby.outcome(claim_draw=True))
+        self.assertIsNone(terminal_score(nearby, 0))
+
+    def test_threefold_claim_uses_only_available_move_history(self) -> None:
+        board = chess.Board()
+        for uci in ("g1f3", "g8f6", "f3g1", "f6g8", "g1f3", "g8f6", "f3g1"):
+            board.push_uci(uci)
+
+        claim = board.outcome(claim_draw=True)
+        self.assertIsNotNone(claim)
+        assert claim is not None
+        self.assertEqual(claim.termination, chess.Termination.THREEFOLD_REPETITION)
+        self.assertEqual(terminal_score(board, 0), 0)
+
+        reconstructed = chess.Board(board.fen())
+        self.assertEqual(len(reconstructed.move_stack), 0)
+        self.assertIsNone(reconstructed.outcome(claim_draw=True))
+        self.assertIsNone(terminal_score(reconstructed, 0))
+
     def test_timeout_returns_legal_fallback(self) -> None:
         board = chess.Board()
         original_fen = board.fen()
@@ -68,6 +103,12 @@ class SearchTests(unittest.TestCase):
         self.assertEqual(result.completed_depth, 0)
         self.assertIn(result.move, board.legal_moves)
         self.assertEqual(board.fen(), original_fen)
+
+    def test_deadline_is_cleared_after_unexpected_exception(self) -> None:
+        engine = ExplodingSearchEngine()
+        with self.assertRaisesRegex(RuntimeError, "deliberate test failure"):
+            engine.search(chess.Board(), 1_000)
+        self.assertTrue(engine.deadline_is_clear())
 
     def test_zero_time_agent_move_is_legal(self) -> None:
         board = chess.Board()

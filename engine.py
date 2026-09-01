@@ -22,6 +22,7 @@ MIN_SEARCH_TIME_MS = 30
 MAX_SOFT_TIME_MS = 1_500
 TIME_DIVISOR = 40
 MAX_RESERVE_MS = 2_000
+MIN_THREEFOLD_CLAIM_PLIES = 7
 
 PIECE_TYPES: tuple[chess.PieceType, ...] = (
     chess.PAWN,
@@ -150,9 +151,17 @@ def terminal_score(board: chess.Board, ply_from_root: int) -> int | None:
             return 0
         return -MATE_SCORE + ply_from_root
 
-    # The halfmove clock is present in FEN, unlike repetition history. The referee claims this
-    # draw automatically, so a claimable fifty-move position is terminal for search purposes.
-    if board.halfmove_clock >= 100:
+    # Match the referee's remaining claim_draw=True checks exactly. The cheap guards avoid move
+    # generation/replay when a claim cannot yet be possible. A root FEN supplies the halfmove
+    # clock but no earlier move stack: starting from that root, the earliest threefold claim is
+    # at ply 7, by announcing a move that will create the third occurrence. If a caller supplies
+    # a Board with real history, len(move_stack) preserves and exposes that available history.
+    if board.halfmove_clock >= 99 and board.can_claim_fifty_moves():
+        return 0
+    if (
+        len(board.move_stack) >= MIN_THREEFOLD_CLAIM_PLIES
+        and board.can_claim_threefold_repetition()
+    ):
         return 0
     return None
 
@@ -204,6 +213,7 @@ class SearchEngine:
 
     def search(self, board: chess.Board, time_left_ms: int) -> SearchResult:
         """Search until the soft/hard budget and return the last completed iteration."""
+        self._deadline_ns = None
         started_ns = self._clock_ns()
         moves = ordered_moves(board)
         root_terminal = terminal_score(board, 0)
@@ -236,21 +246,23 @@ class SearchEngine:
         soft_deadline_ns = started_ns + budget.soft_ms * 1_000_000
         self._deadline_ns = started_ns + budget.hard_ms * 1_000_000
         depth = 1
-        while True:
-            try:
-                iteration_move, iteration_score = self._search_depth(board, depth)
-            except SearchTimeout:
-                timed_out = True
-                break
-            if iteration_move is not None:
-                best_move = iteration_move
-                best_score = iteration_score
-                completed_depth = depth
-            if abs(best_score) >= MATE_THRESHOLD or self._clock_ns() >= soft_deadline_ns:
-                break
-            depth += 1
+        try:
+            while True:
+                try:
+                    iteration_move, iteration_score = self._search_depth(board, depth)
+                except SearchTimeout:
+                    timed_out = True
+                    break
+                if iteration_move is not None:
+                    best_move = iteration_move
+                    best_score = iteration_score
+                    completed_depth = depth
+                if abs(best_score) >= MATE_THRESHOLD or self._clock_ns() >= soft_deadline_ns:
+                    break
+                depth += 1
+        finally:
+            self._deadline_ns = None
 
-        self._deadline_ns = None
         return SearchResult(
             move=best_move,
             score=best_score,
