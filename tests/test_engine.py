@@ -124,6 +124,36 @@ class SearchTests(unittest.TestCase):
         self.assertEqual(scores, sorted(scores, reverse=True))
         self.assertEqual(first[0].promotion, chess.QUEEN)
 
+    def test_preferred_move_is_first_without_reordering_the_rest(self) -> None:
+        board = chess.Board()
+        default = ordered_moves(board)
+        preferred = chess.Move.from_uci("g1f3")
+        reordered = ordered_moves(board, preferred)
+        self.assertEqual(reordered[0], preferred)
+        self.assertEqual(reordered[1:], [move for move in default if move != preferred])
+
+    def test_iterative_deepening_reuses_the_completed_principal_variation(self) -> None:
+        board = chess.Board()
+        result = SearchEngine(TickingClock(step_ns=1_000)).search(board, 1_000)
+        repeated = SearchEngine(TickingClock(step_ns=1_000)).search(board, 1_000)
+        self.assertGreaterEqual(result.completed_depth, 2)
+        self.assertEqual(result.move, repeated.move)
+        self.assertEqual(result.score, repeated.score)
+        self.assertEqual(result.completed_depth, repeated.completed_depth)
+        self.assertEqual(result.nodes, repeated.nodes)
+        self.assertEqual(result.cutoffs, repeated.cutoffs)
+        self.assertEqual(result.depth_diagnostics, repeated.depth_diagnostics)
+        self.assertEqual(
+            result.root_pv_reuses,
+            len(result.depth_diagnostics) - 1,
+        )
+        self.assertFalse(result.depth_diagnostics[0].root_pv_reused)
+        self.assertTrue(all(item.nodes > 0 for item in result.depth_diagnostics))
+        for item in result.depth_diagnostics[1:]:
+            self.assertTrue(item.root_pv_reused)
+            self.assertIsNotNone(item.first_move)
+        self.assertGreater(result.cutoffs, 0)
+
     def test_mate_distance_prefers_faster_wins_and_slower_losses(self) -> None:
         checkmated = chess.Board("7k/6Q1/6K1/8/8/8/8/8 b - - 0 1")
         fast_loss = terminal_score(checkmated, 1)

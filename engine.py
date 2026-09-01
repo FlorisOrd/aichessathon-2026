@@ -69,11 +69,25 @@ class TimeBudget:
 
 
 @dataclass(frozen=True)
+class DepthDiagnostics:
+    depth: int
+    nodes: int
+    cutoffs: int
+    first_move: chess.Move | None
+    root_pv_reused: bool
+    pv_plies: int
+
+
+@dataclass(frozen=True)
 class SearchResult:
     move: chess.Move | None
     score: int
     completed_depth: int
     nodes: int
+    cutoffs: int
+    root_pv_reuses: int
+    root_first_move: chess.Move | None
+    depth_diagnostics: tuple[DepthDiagnostics, ...]
     elapsed_ms: float
     timed_out: bool
 
@@ -182,9 +196,18 @@ def move_order_score(board: chess.Board, move: chess.Move) -> int:
     return score
 
 
-def ordered_moves(board: chess.Board) -> list[chess.Move]:
-    """Return legal moves in a deterministic, replaceable first-pass order."""
-    return sorted(board.legal_moves, key=lambda move: (-move_order_score(board, move), move.uci()))
+def ordered_moves(
+    board: chess.Board, preferred_move: chess.Move | None = None
+) -> list[chess.Move]:
+    """Return legal moves with an optional first move and deterministic ordering for the rest."""
+    moves = sorted(
+        board.legal_moves,
+        key=lambda move: (-move_order_score(board, move), move.uci()),
+    )
+    if preferred_move is not None and preferred_move in moves:
+        moves.remove(preferred_move)
+        moves.insert(0, preferred_move)
+    return moves
 
 
 def allocate_time(time_left_ms: int) -> TimeBudget:
@@ -210,6 +233,11 @@ class SearchEngine:
         self._clock_ns = clock_ns
         self._deadline_ns: int | None = None
         self._nodes = 0
+        self._cutoffs = 0
+        self._pv_hint: tuple[chess.Move, ...] = ()
+        self._iteration_pv: tuple[chess.Move, ...] = ()
+        self._iteration_first_move: chess.Move | None = None
+        self._iteration_root_pv_reused = False
 
     def search(self, board: chess.Board, time_left_ms: int) -> SearchResult:
         """Search until the soft/hard budget and return the last completed iteration."""
@@ -223,6 +251,10 @@ class SearchEngine:
                 score=root_terminal if root_terminal is not None else 0,
                 completed_depth=0,
                 nodes=0,
+                cutoffs=0,
+                root_pv_reuses=0,
+                root_first_move=None,
+                depth_diagnostics=(),
                 elapsed_ms=self._elapsed_ms(started_ns),
                 timed_out=False,
             )
@@ -232,6 +264,12 @@ class SearchEngine:
         completed_depth = 0
         timed_out = False
         self._nodes = 0
+        self._cutoffs = 0
+        self._pv_hint = ()
+        self._iteration_pv = ()
+        self._iteration_first_move = None
+        self._iteration_root_pv_reused = False
+        completed_diagnostics: list[DepthDiagnostics] = []
         budget = allocate_time(time_left_ms)
         if budget.hard_ms == 0:
             return SearchResult(
@@ -239,6 +277,10 @@ class SearchEngine:
                 score=best_score,
                 completed_depth=0,
                 nodes=0,
+                cutoffs=0,
+                root_pv_reuses=0,
+                root_first_move=None,
+                depth_diagnostics=(),
                 elapsed_ms=self._elapsed_ms(started_ns),
                 timed_out=False,
             )
@@ -248,6 +290,8 @@ class SearchEngine:
         depth = 1
         try:
             while True:
+                iteration_start_nodes = self._nodes
+                iteration_start_cutoffs = self._cutoffs
                 try:
                     iteration_move, iteration_score = self._search_depth(board, depth)
                 except SearchTimeout:
@@ -257,6 +301,17 @@ class SearchEngine:
                     best_move = iteration_move
                     best_score = iteration_score
                     completed_depth = depth
+                    completed_diagnostics.append(
+                        DepthDiagnostics(
+                            depth=depth,
+                            nodes=self._nodes - iteration_start_nodes,
+                            cutoffs=self._cutoffs - iteration_start_cutoffs,
+                            first_move=self._iteration_first_move,
+                            root_pv_reused=self._iteration_root_pv_reused,
+                            pv_plies=len(self._iteration_pv),
+                        )
+                    )
+                    self._pv_hint = self._iteration_pv
                 if abs(best_score) >= MATE_THRESHOLD or self._clock_ns() >= soft_deadline_ns:
                     break
                 depth += 1
@@ -268,6 +323,12 @@ class SearchEngine:
             score=best_score,
             completed_depth=completed_depth,
             nodes=self._nodes,
+            cutoffs=self._cutoffs,
+            root_pv_reuses=sum(item.root_pv_reused for item in completed_diagnostics),
+            root_first_move=(
+                completed_diagnostics[-1].first_move if completed_diagnostics else None
+            ),
+            depth_diagnostics=tuple(completed_diagnostics),
             elapsed_ms=self._elapsed_ms(started_ns),
             timed_out=timed_out,
         )
@@ -278,13 +339,30 @@ class SearchEngine:
             raise ValueError("depth must be at least 1")
         started_ns = self._clock_ns()
         self._nodes = 0
+        self._cutoffs = 0
         self._deadline_ns = None
+        self._pv_hint = ()
+        self._iteration_pv = ()
+        self._iteration_first_move = None
+        self._iteration_root_pv_reused = False
         move, score = self._search_depth(board, depth)
+        diagnostics = DepthDiagnostics(
+            depth=depth,
+            nodes=self._nodes,
+            cutoffs=self._cutoffs,
+            first_move=self._iteration_first_move,
+            root_pv_reused=False,
+            pv_plies=len(self._iteration_pv),
+        )
         return SearchResult(
             move=move,
             score=score,
             completed_depth=depth,
             nodes=self._nodes,
+            cutoffs=self._cutoffs,
+            root_pv_reuses=0,
+            root_first_move=self._iteration_first_move,
+            depth_diagnostics=(diagnostics,),
             elapsed_ms=self._elapsed_ms(started_ns),
             timed_out=False,
         )
@@ -295,19 +373,37 @@ class SearchEngine:
         if terminal is not None:
             return None, terminal
 
+        preferred_move = self._pv_hint[0] if self._pv_hint else None
+        moves = ordered_moves(board, preferred_move)
+        self._iteration_first_move = moves[0] if moves else None
+        self._iteration_root_pv_reused = (
+            preferred_move is not None and self._iteration_first_move == preferred_move
+        )
         best_move: chess.Move | None = None
         best_score = -INFINITY
+        best_pv: tuple[chess.Move, ...] = ()
         alpha = -INFINITY
-        for move in ordered_moves(board):
+        for move in moves:
+            child_hint = self._pv_hint[1:] if move == preferred_move else ()
             board.push(move)
             try:
-                score = -self._negamax(board, depth - 1, -INFINITY, -alpha, 1)
+                child_score, child_pv = self._negamax(
+                    board,
+                    depth - 1,
+                    -INFINITY,
+                    -alpha,
+                    1,
+                    child_hint,
+                )
+                score = -child_score
             finally:
                 board.pop()
             if score > best_score:
                 best_score = score
                 best_move = move
+                best_pv = (move, *child_pv)
             alpha = max(alpha, score)
+        self._iteration_pv = best_pv
         return best_move, best_score
 
     def _negamax(
@@ -317,32 +413,41 @@ class SearchEngine:
         alpha: int,
         beta: int,
         ply_from_root: int,
-    ) -> int:
+        pv_hint: tuple[chess.Move, ...],
+    ) -> tuple[int, tuple[chess.Move, ...]]:
         self._visit_node()
         terminal = terminal_score(board, ply_from_root)
         if terminal is not None:
-            return terminal
+            return terminal, ()
         if depth == 0:
-            return evaluate(board)
+            return evaluate(board), ()
 
         best_score = -INFINITY
-        for move in ordered_moves(board):
+        best_pv: tuple[chess.Move, ...] = ()
+        preferred_move = pv_hint[0] if pv_hint else None
+        for move in ordered_moves(board, preferred_move):
+            child_hint = pv_hint[1:] if move == preferred_move else ()
             board.push(move)
             try:
-                score = -self._negamax(
+                child_score, child_pv = self._negamax(
                     board,
                     depth - 1,
                     -beta,
                     -alpha,
                     ply_from_root + 1,
+                    child_hint,
                 )
+                score = -child_score
             finally:
                 board.pop()
-            best_score = max(best_score, score)
+            if score > best_score:
+                best_score = score
+                best_pv = (move, *child_pv)
             alpha = max(alpha, score)
             if alpha >= beta:
+                self._cutoffs += 1
                 break
-        return best_score
+        return best_score, best_pv
 
     def _visit_node(self) -> None:
         self._nodes += 1
