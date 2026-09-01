@@ -103,6 +103,9 @@ generated files under `benchmarks/results/` are ignored. PGN output is optional 
 normally record all scheduled games before exiting with status 2 if an agent failed; add
 `--fail-fast` to stop after the first crash, illegal move, flag, init failure, or `both_failed`.
 
+The fixed Phase 2 development and holdout position sets, their deterministic generator, provenance,
+and holdout-use policy are documented in [`docs/BENCHMARK_SUITES.md`](docs/BENCHMARK_SUITES.md).
+
 ## The rules
 
 [aichessathon.com/docs](https://aichessathon.com/docs) is canonical and changes. Read it before

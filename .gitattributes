@@ -1,0 +1,3 @@
+benchmarks/positions/development-64.fens text eol=lf
+benchmarks/positions/development-fast-16.fens text eol=lf
+benchmarks/positions/holdout-32.fens text eol=lf
