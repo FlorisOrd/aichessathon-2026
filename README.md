@@ -75,6 +75,34 @@ curated neutral positions.
 The harness is here so your games are honest, not so you can pre-validate an upload. Acceptance
 happens on the platform, and the validation log on your dashboard is the authority on it.
 
+## Reproducible benchmarks
+
+`tools.arena_suite` compares a candidate with any local opponent directory over a FEN suite. Each
+position is played twice with colors reversed, which controls for color and starting-position
+bias. The official `harness/` referee remains authoritative and must not be changed.
+
+Fast candidate-versus-baseline smoke run from PowerShell:
+
+```
+uv run python -m tools.arena_suite --agent . --opponent baselines/greedy `
+  --json-output benchmarks/results/smoke.json --pgn-output benchmarks/results/smoke.pgn
+```
+
+For candidate-versus-champion testing, pass their Git worktree directories to `--agent` and
+`--opponent`. Competition-clock example:
+
+```
+uv run python -m tools.arena_suite --agent C:\worktrees\candidate `
+  --opponent C:\worktrees\champion --repeats 10 --shuffle --seed 2026 `
+  --base-ms 120000 --increment-ms 500 --ply-cap 300 `
+  --json-output benchmarks/results/competition.json
+```
+
+The bundled smoke FENs are used by default. JSON is written only when `--json-output` is supplied;
+generated files under `benchmarks/results/` are ignored. PGN output is optional and separate. Runs
+normally record all scheduled games before exiting with status 2 if an agent failed; add
+`--fail-fast` to stop after the first crash, illegal move, flag, init failure, or `both_failed`.
+
 ## The rules
 
 [aichessathon.com/docs](https://aichessathon.com/docs) is canonical and changes. Read it before

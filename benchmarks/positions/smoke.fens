@@ -1,0 +1,12 @@
+# Infrastructure smoke suite. One legal FEN per non-comment line.
+# Standard initial position.
+rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1
+
+# Non-standard start with Black to move after 1. e4.
+rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1
+
+# Balanced Ruy Lopez structure.
+r1bq1rk1/2p1bppp/p1np1n2/1p2p3/4P3/1BP2N1P/PP1P1PP1/RNBQR1K1 b - - 0 9
+
+# Balanced Queen's Gambit structure.
+r2q1rk1/pbpnbpp1/1p3n1p/3p4/3P3B/2NBPN2/PP3PPP/R2Q1RK1 w - - 4 11
