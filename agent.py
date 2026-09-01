@@ -30,7 +30,7 @@ def get_move(fen: str, time_left_ms: int) -> str:
         move = fallback
     print(
         f"move={move.uci()} depth={result.completed_depth} score={result.score} "
-        f"nodes={result.nodes} elapsed_ms={result.elapsed_ms:.1f} "
+        f"nodes={result.nodes} qnodes={result.qnodes} elapsed_ms={result.elapsed_ms:.1f} "
         f"timeout={'yes' if result.timed_out else 'no'}",
         flush=True,
     )

@@ -4,6 +4,7 @@ import chess
 
 import agent
 from engine import (
+    INFINITY,
     MATE_SCORE,
     SearchEngine,
     evaluate,
@@ -23,8 +24,14 @@ class TickingClock:
         return self.value
 
 
-class ExplodingSearchEngine(SearchEngine):
-    def _search_depth(self, board: chess.Board, depth: int) -> tuple[chess.Move | None, int]:
+class ExplodingQSearchEngine(SearchEngine):
+    def _qsearch(
+        self,
+        board: chess.Board,
+        alpha: int,
+        beta: int,
+        ply_from_root: int,
+    ) -> int:
         raise RuntimeError("deliberate test failure")
 
     def deadline_is_clear(self) -> bool:
@@ -101,14 +108,56 @@ class SearchTests(unittest.TestCase):
         result = SearchEngine(TickingClock(step_ns=5_000_000)).search(board, 100)
         self.assertTrue(result.timed_out)
         self.assertEqual(result.completed_depth, 0)
+        self.assertGreater(result.qnodes, 0)
         self.assertIn(result.move, board.legal_moves)
         self.assertEqual(board.fen(), original_fen)
 
-    def test_deadline_is_cleared_after_unexpected_exception(self) -> None:
-        engine = ExplodingSearchEngine()
+    def test_board_and_deadline_are_restored_after_qsearch_exception(self) -> None:
+        board = chess.Board()
+        original_fen = board.fen()
+        engine = ExplodingQSearchEngine()
         with self.assertRaisesRegex(RuntimeError, "deliberate test failure"):
-            engine.search(chess.Board(), 1_000)
+            engine.search(board, 1_000)
+        self.assertEqual(board.fen(), original_fen)
         self.assertTrue(engine.deadline_is_clear())
+
+    def test_qsearch_avoids_a_horizon_capture_blunder(self) -> None:
+        board = chess.Board("3r2k1/4q3/8/8/8/8/8/3Q2K1 w - - 0 1")
+        static_result = SearchEngine(use_quiescence=False).search_fixed_depth(board, 1)
+        qsearch_result = SearchEngine().search_fixed_depth(board, 1)
+        self.assertEqual(static_result.move, chess.Move.from_uci("d1d8"))
+        self.assertNotEqual(qsearch_result.move, chess.Move.from_uci("d1d8"))
+        self.assertEqual(static_result.qnodes, 0)
+        self.assertGreater(qsearch_result.qnodes, 0)
+
+    def test_in_check_qsearch_searches_all_quiet_evasions(self) -> None:
+        board = chess.Board("k3r3/8/8/8/8/8/8/4K3 w - - 0 1")
+        evasions = ordered_moves(board)
+        self.assertTrue(board.is_check())
+        self.assertTrue(
+            all(not board.is_capture(move) and move.promotion is None for move in evasions)
+        )
+
+        engine = SearchEngine()
+        original_fen = board.fen()
+        engine._qsearch(board, -INFINITY, INFINITY, 0)
+        self.assertEqual(engine._qnodes, 1 + len(evasions))
+        self.assertEqual(board.fen(), original_fen)
+
+    def test_qsearch_includes_promotions(self) -> None:
+        board = chess.Board("8/P6k/8/8/8/8/8/4K3 w - - 0 1")
+        stand_pat = evaluate(board)
+        engine = SearchEngine()
+        score = engine._qsearch(board, -INFINITY, INFINITY, 0)
+        self.assertGreater(score, stand_pat)
+        self.assertEqual(engine._qnodes, 5)
+
+    def test_qsearch_preserves_terminal_and_mate_distance_scores(self) -> None:
+        checkmate = chess.Board("7k/6Q1/6K1/8/8/8/8/8 b - - 0 1")
+        stalemate = chess.Board("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1")
+        engine = SearchEngine()
+        self.assertEqual(engine._qsearch(checkmate, -INFINITY, INFINITY, 4), -MATE_SCORE + 4)
+        self.assertEqual(engine._qsearch(stalemate, -INFINITY, INFINITY, 4), 0)
 
     def test_zero_time_agent_move_is_legal(self) -> None:
         board = chess.Board()

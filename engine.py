@@ -74,6 +74,7 @@ class SearchResult:
     score: int
     completed_depth: int
     nodes: int
+    qnodes: int
     elapsed_ms: float
     timed_out: bool
 
@@ -206,10 +207,17 @@ def allocate_time(time_left_ms: int) -> TimeBudget:
 class SearchEngine:
     """Stateful only for one search; the reference engine intentionally has no cache."""
 
-    def __init__(self, clock_ns: Callable[[], int] = time.monotonic_ns) -> None:
+    def __init__(
+        self,
+        clock_ns: Callable[[], int] = time.monotonic_ns,
+        *,
+        use_quiescence: bool = True,
+    ) -> None:
         self._clock_ns = clock_ns
+        self._use_quiescence = use_quiescence
         self._deadline_ns: int | None = None
         self._nodes = 0
+        self._qnodes = 0
 
     def search(self, board: chess.Board, time_left_ms: int) -> SearchResult:
         """Search until the soft/hard budget and return the last completed iteration."""
@@ -223,6 +231,7 @@ class SearchEngine:
                 score=root_terminal if root_terminal is not None else 0,
                 completed_depth=0,
                 nodes=0,
+                qnodes=0,
                 elapsed_ms=self._elapsed_ms(started_ns),
                 timed_out=False,
             )
@@ -232,6 +241,7 @@ class SearchEngine:
         completed_depth = 0
         timed_out = False
         self._nodes = 0
+        self._qnodes = 0
         budget = allocate_time(time_left_ms)
         if budget.hard_ms == 0:
             return SearchResult(
@@ -239,6 +249,7 @@ class SearchEngine:
                 score=best_score,
                 completed_depth=0,
                 nodes=0,
+                qnodes=0,
                 elapsed_ms=self._elapsed_ms(started_ns),
                 timed_out=False,
             )
@@ -268,6 +279,7 @@ class SearchEngine:
             score=best_score,
             completed_depth=completed_depth,
             nodes=self._nodes,
+            qnodes=self._qnodes,
             elapsed_ms=self._elapsed_ms(started_ns),
             timed_out=timed_out,
         )
@@ -278,6 +290,7 @@ class SearchEngine:
             raise ValueError("depth must be at least 1")
         started_ns = self._clock_ns()
         self._nodes = 0
+        self._qnodes = 0
         self._deadline_ns = None
         move, score = self._search_depth(board, depth)
         return SearchResult(
@@ -285,6 +298,7 @@ class SearchEngine:
             score=score,
             completed_depth=depth,
             nodes=self._nodes,
+            qnodes=self._qnodes,
             elapsed_ms=self._elapsed_ms(started_ns),
             timed_out=False,
         )
@@ -318,6 +332,9 @@ class SearchEngine:
         beta: int,
         ply_from_root: int,
     ) -> int:
+        if depth == 0 and self._use_quiescence:
+            return self._qsearch(board, alpha, beta, ply_from_root)
+
         self._visit_node()
         terminal = terminal_score(board, ply_from_root)
         if terminal is not None:
@@ -344,8 +361,58 @@ class SearchEngine:
                 break
         return best_score
 
+    def _qsearch(
+        self,
+        board: chess.Board,
+        alpha: int,
+        beta: int,
+        ply_from_root: int,
+    ) -> int:
+        """Resolve captures, promotions, and all check evasions before static evaluation."""
+        self._visit_qnode()
+        terminal = terminal_score(board, ply_from_root)
+        if terminal is not None:
+            return terminal
+
+        in_check = board.is_check()
+        if in_check:
+            best_score = -INFINITY
+            moves = ordered_moves(board)
+        else:
+            best_score = evaluate(board)
+            if best_score >= beta:
+                return best_score
+            alpha = max(alpha, best_score)
+            moves = [
+                move
+                for move in ordered_moves(board)
+                if board.is_capture(move) or move.promotion is not None
+            ]
+
+        for move in moves:
+            board.push(move)
+            try:
+                score = -self._qsearch(
+                    board,
+                    -beta,
+                    -alpha,
+                    ply_from_root + 1,
+                )
+            finally:
+                board.pop()
+            best_score = max(best_score, score)
+            alpha = max(alpha, score)
+            if alpha >= beta:
+                break
+        return best_score
+
     def _visit_node(self) -> None:
         self._nodes += 1
+        if self._deadline_ns is not None and self._clock_ns() >= self._deadline_ns:
+            raise SearchTimeout
+
+    def _visit_qnode(self) -> None:
+        self._qnodes += 1
         if self._deadline_ns is not None and self._clock_ns() >= self._deadline_ns:
             raise SearchTimeout
 
