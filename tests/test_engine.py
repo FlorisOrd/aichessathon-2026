@@ -4,8 +4,10 @@ import chess
 
 import agent
 from engine import (
+    DELTA_MARGIN,
     INFINITY,
     MATE_SCORE,
+    MATE_THRESHOLD,
     SearchEngine,
     evaluate,
     move_order_score,
@@ -142,6 +144,7 @@ class SearchTests(unittest.TestCase):
         original_fen = board.fen()
         engine._qsearch(board, -INFINITY, INFINITY, 0)
         self.assertEqual(engine._qnodes, 1 + len(evasions))
+        self.assertEqual(engine._delta_pruned, 0)
         self.assertEqual(board.fen(), original_fen)
 
     def test_qsearch_includes_promotions(self) -> None:
@@ -151,6 +154,131 @@ class SearchTests(unittest.TestCase):
         score = engine._qsearch(board, -INFINITY, INFINITY, 0)
         self.assertGreater(score, stand_pat)
         self.assertEqual(engine._qnodes, 5)
+        self.assertEqual(engine._delta_pruned, 0)
+
+    def test_clearly_irrelevant_low_value_capture_is_delta_pruned(self) -> None:
+        board = chess.Board("7k/8/8/3p4/4P3/8/8/K7 w - - 0 1")
+        stand_pat = evaluate(board)
+        engine = SearchEngine()
+
+        score = engine._qsearch(
+            board,
+            stand_pat + 120 + DELTA_MARGIN,
+            INFINITY,
+            0,
+        )
+
+        self.assertEqual(score, stand_pat)
+        self.assertEqual(engine._qnodes, 1)
+        self.assertEqual(engine._delta_pruned, 1)
+
+    def test_tactical_capture_near_alpha_is_not_delta_pruned(self) -> None:
+        board = chess.Board("7k/8/8/3p4/4P3/8/8/K7 w - - 0 1")
+        stand_pat = evaluate(board)
+        engine = SearchEngine()
+
+        engine._qsearch(
+            board,
+            stand_pat + 120 + DELTA_MARGIN - 1,
+            INFINITY,
+            0,
+        )
+
+        self.assertEqual(engine._qnodes, 2)
+        self.assertEqual(engine._delta_pruned, 0)
+
+    def test_capture_promotions_are_never_delta_pruned(self) -> None:
+        board = chess.Board("r7/1P5k/8/8/8/8/8/2K5 w - - 0 1")
+        promotions = [move for move in board.legal_moves if move.promotion is not None]
+        self.assertEqual(len(promotions), 8)
+        engine = SearchEngine()
+
+        engine._qsearch(board, evaluate(board) + 2_000, INFINITY, 0)
+
+        self.assertEqual(engine._qnodes, 1 + len(promotions))
+        self.assertEqual(engine._delta_pruned, 0)
+
+    def test_check_evasions_are_never_delta_pruned_even_with_high_alpha(self) -> None:
+        board = chess.Board("k3r3/8/8/8/8/8/8/4K3 w - - 0 1")
+        evasions = list(board.legal_moves)
+        engine = SearchEngine()
+
+        engine._qsearch(board, 100_000, INFINITY, 0)
+
+        self.assertEqual(engine._qnodes, 1 + len(evasions))
+        self.assertEqual(engine._delta_pruned, 0)
+
+    def test_mate_score_window_disables_delta_pruning(self) -> None:
+        board = chess.Board("7k/8/8/3p4/4P3/8/8/K7 w - - 0 1")
+        engine = SearchEngine()
+
+        engine._qsearch(board, MATE_THRESHOLD, INFINITY, 0)
+
+        self.assertEqual(engine._qnodes, 2)
+        self.assertEqual(engine._delta_pruned, 0)
+
+    def test_en_passant_uses_conservative_pawn_value(self) -> None:
+        board = chess.Board("7k/8/8/3pP3/8/8/8/K7 w - d6 0 1")
+        stand_pat = evaluate(board)
+        near_engine = SearchEngine()
+        prune_engine = SearchEngine()
+
+        near_engine._qsearch(
+            board,
+            stand_pat + 100 + DELTA_MARGIN + 1,
+            INFINITY,
+            0,
+        )
+        prune_engine._qsearch(
+            board,
+            stand_pat + 120 + DELTA_MARGIN,
+            INFINITY,
+            0,
+        )
+
+        self.assertEqual(near_engine._qnodes, 2)
+        self.assertEqual(near_engine._delta_pruned, 0)
+        self.assertEqual(prune_engine._qnodes, 1)
+        self.assertEqual(prune_engine._delta_pruned, 1)
+
+    def test_delta_pruning_restores_the_board(self) -> None:
+        board = chess.Board("7k/8/8/3p4/4P3/8/8/K7 w - - 0 1")
+        original_fen = board.fen()
+        engine = SearchEngine()
+
+        engine._qsearch(board, evaluate(board) + 120 + DELTA_MARGIN, INFINITY, 0)
+
+        self.assertEqual(engine._delta_pruned, 1)
+        self.assertEqual(board.fen(), original_fen)
+
+    def test_terminal_capture_is_not_delta_pruned(self) -> None:
+        board = chess.Board("7k/6r1/5KQ1/8/8/8/8/8 w - - 0 1")
+        move = chess.Move.from_uci("g6g7")
+        self.assertIn(move, board.legal_moves)
+        board.push(move)
+        self.assertTrue(board.is_checkmate())
+        board.pop()
+        engine = SearchEngine()
+
+        score = engine._qsearch(board, evaluate(board) + 1_000, INFINITY, 0)
+
+        self.assertGreaterEqual(score, MATE_THRESHOLD)
+        self.assertEqual(engine._delta_pruned, 0)
+
+    def test_terminal_draw_capture_is_not_delta_pruned(self) -> None:
+        board = chess.Board("8/7k/8/8/3n4/2B5/8/K7 w - - 0 1")
+        move = chess.Move.from_uci("c3d4")
+        self.assertIn(move, board.legal_moves)
+        self.assertFalse(board.gives_check(move))
+        board.push(move)
+        self.assertTrue(board.is_insufficient_material())
+        board.pop()
+        engine = SearchEngine()
+
+        engine._qsearch(board, evaluate(board) + 1_000, INFINITY, 0)
+
+        self.assertEqual(engine._qnodes, 2)
+        self.assertEqual(engine._delta_pruned, 0)
 
     def test_qsearch_preserves_terminal_and_mate_distance_scores(self) -> None:
         checkmate = chess.Board("7k/6Q1/6K1/8/8/8/8/8 b - - 0 1")

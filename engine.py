@@ -23,6 +23,7 @@ MAX_SOFT_TIME_MS = 1_500
 TIME_DIVISOR = 40
 MAX_RESERVE_MS = 2_000
 MIN_THREEFOLD_CLAIM_PLIES = 7
+DELTA_MARGIN = 150
 
 PIECE_TYPES: tuple[chess.PieceType, ...] = (
     chess.PAWN,
@@ -75,6 +76,7 @@ class SearchResult:
     completed_depth: int
     nodes: int
     qnodes: int
+    delta_pruned: int
     elapsed_ms: float
     timed_out: bool
 
@@ -218,6 +220,7 @@ class SearchEngine:
         self._deadline_ns: int | None = None
         self._nodes = 0
         self._qnodes = 0
+        self._delta_pruned = 0
 
     def search(self, board: chess.Board, time_left_ms: int) -> SearchResult:
         """Search until the soft/hard budget and return the last completed iteration."""
@@ -232,6 +235,7 @@ class SearchEngine:
                 completed_depth=0,
                 nodes=0,
                 qnodes=0,
+                delta_pruned=0,
                 elapsed_ms=self._elapsed_ms(started_ns),
                 timed_out=False,
             )
@@ -242,6 +246,7 @@ class SearchEngine:
         timed_out = False
         self._nodes = 0
         self._qnodes = 0
+        self._delta_pruned = 0
         budget = allocate_time(time_left_ms)
         if budget.hard_ms == 0:
             return SearchResult(
@@ -250,6 +255,7 @@ class SearchEngine:
                 completed_depth=0,
                 nodes=0,
                 qnodes=0,
+                delta_pruned=0,
                 elapsed_ms=self._elapsed_ms(started_ns),
                 timed_out=False,
             )
@@ -280,6 +286,7 @@ class SearchEngine:
             completed_depth=completed_depth,
             nodes=self._nodes,
             qnodes=self._qnodes,
+            delta_pruned=self._delta_pruned,
             elapsed_ms=self._elapsed_ms(started_ns),
             timed_out=timed_out,
         )
@@ -291,6 +298,7 @@ class SearchEngine:
         started_ns = self._clock_ns()
         self._nodes = 0
         self._qnodes = 0
+        self._delta_pruned = 0
         self._deadline_ns = None
         move, score = self._search_depth(board, depth)
         return SearchResult(
@@ -299,6 +307,7 @@ class SearchEngine:
             completed_depth=depth,
             nodes=self._nodes,
             qnodes=self._qnodes,
+            delta_pruned=self._delta_pruned,
             elapsed_ms=self._elapsed_ms(started_ns),
             timed_out=False,
         )
@@ -375,14 +384,16 @@ class SearchEngine:
             return terminal
 
         in_check = board.is_check()
+        stand_pat: int | None = None
         if in_check:
             best_score = -INFINITY
             moves = ordered_moves(board)
         else:
-            best_score = evaluate(board)
-            if best_score >= beta:
-                return best_score
-            alpha = max(alpha, best_score)
+            stand_pat = evaluate(board)
+            best_score = stand_pat
+            if stand_pat >= beta:
+                return stand_pat
+            alpha = max(alpha, stand_pat)
             moves = [
                 move
                 for move in ordered_moves(board)
@@ -390,6 +401,16 @@ class SearchEngine:
             ]
 
         for move in moves:
+            if stand_pat is not None and self._can_delta_prune(
+                board,
+                move,
+                stand_pat,
+                alpha,
+                beta,
+                ply_from_root,
+            ):
+                self._delta_pruned += 1
+                continue
             board.push(move)
             try:
                 score = -self._qsearch(
@@ -405,6 +426,56 @@ class SearchEngine:
             if alpha >= beta:
                 break
         return best_score
+
+    def _can_delta_prune(
+        self,
+        board: chess.Board,
+        move: chess.Move,
+        stand_pat: int,
+        alpha: int,
+        beta: int,
+        ply_from_root: int,
+    ) -> bool:
+        """Return whether a non-check qsearch capture is safely below alpha.
+
+        The fixed 150 cp margin covers ordinary piece-square and tapered-phase effects that are
+        not represented by the captured piece's nominal value. Promotions, checking captures,
+        mate-score windows, check nodes, and moves producing an immediate terminal result are
+        deliberately protected.
+        """
+        if (
+            board.is_check()
+            or move.promotion is not None
+            or not board.is_capture(move)
+            or board.gives_check(move)
+            or self._near_mate_window(alpha, beta)
+        ):
+            return False
+
+        captured_type = (
+            chess.PAWN if board.is_en_passant(move) else board.piece_type_at(move.to_square)
+        )
+        if captured_type is None:
+            return False
+        captured_value = max(
+            MIDDLEGAME_VALUES[captured_type],
+            ENDGAME_VALUES[captured_type],
+        )
+        if stand_pat + captured_value + DELTA_MARGIN > alpha:
+            return False
+
+        board.push(move)
+        try:
+            return terminal_score(board, ply_from_root + 1) is None
+        finally:
+            board.pop()
+
+    @staticmethod
+    def _near_mate_window(alpha: int, beta: int) -> bool:
+        return any(
+            MATE_THRESHOLD <= abs(bound) <= MATE_SCORE
+            for bound in (alpha, beta)
+        )
 
     def _visit_node(self) -> None:
         self._nodes += 1
