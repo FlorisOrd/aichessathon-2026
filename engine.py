@@ -23,6 +23,10 @@ MAX_SOFT_TIME_MS = 1_500
 TIME_DIVISOR = 40
 MAX_RESERVE_MS = 2_000
 MIN_THREEFOLD_CLAIM_PLIES = 7
+MAX_KILLERS_PER_PLY = 2
+HISTORY_MAX = 1_000_000
+
+HistoryKey = tuple[chess.Color, chess.Square, chess.Square]
 
 PIECE_TYPES: tuple[chess.PieceType, ...] = (
     chess.PAWN,
@@ -75,6 +79,9 @@ class SearchResult:
     completed_depth: int
     nodes: int
     qnodes: int
+    beta_cutoffs: int
+    killer_first_searches: int
+    history_ordered_moves: int
     elapsed_ms: float
     timed_out: bool
 
@@ -212,17 +219,25 @@ class SearchEngine:
         clock_ns: Callable[[], int] = time.monotonic_ns,
         *,
         use_quiescence: bool = True,
+        use_move_heuristics: bool = True,
     ) -> None:
         self._clock_ns = clock_ns
         self._use_quiescence = use_quiescence
+        self._use_move_heuristics = use_move_heuristics
         self._deadline_ns: int | None = None
         self._nodes = 0
         self._qnodes = 0
+        self._beta_cutoffs = 0
+        self._killer_first_searches = 0
+        self._history_ordered_moves = 0
+        self._killers: dict[int, list[chess.Move]] = {}
+        self._history: dict[HistoryKey, int] = {}
 
     def search(self, board: chess.Board, time_left_ms: int) -> SearchResult:
         """Search until the soft/hard budget and return the last completed iteration."""
         self._deadline_ns = None
         started_ns = self._clock_ns()
+        self._reset_search_heuristics()
         moves = ordered_moves(board)
         root_terminal = terminal_score(board, 0)
         if not moves:
@@ -232,6 +247,9 @@ class SearchEngine:
                 completed_depth=0,
                 nodes=0,
                 qnodes=0,
+                beta_cutoffs=0,
+                killer_first_searches=0,
+                history_ordered_moves=0,
                 elapsed_ms=self._elapsed_ms(started_ns),
                 timed_out=False,
             )
@@ -250,6 +268,9 @@ class SearchEngine:
                 completed_depth=0,
                 nodes=0,
                 qnodes=0,
+                beta_cutoffs=0,
+                killer_first_searches=0,
+                history_ordered_moves=0,
                 elapsed_ms=self._elapsed_ms(started_ns),
                 timed_out=False,
             )
@@ -280,6 +301,9 @@ class SearchEngine:
             completed_depth=completed_depth,
             nodes=self._nodes,
             qnodes=self._qnodes,
+            beta_cutoffs=self._beta_cutoffs,
+            killer_first_searches=self._killer_first_searches,
+            history_ordered_moves=self._history_ordered_moves,
             elapsed_ms=self._elapsed_ms(started_ns),
             timed_out=timed_out,
         )
@@ -289,6 +313,7 @@ class SearchEngine:
         if depth < 1:
             raise ValueError("depth must be at least 1")
         started_ns = self._clock_ns()
+        self._reset_search_heuristics()
         self._nodes = 0
         self._qnodes = 0
         self._deadline_ns = None
@@ -299,6 +324,9 @@ class SearchEngine:
             completed_depth=depth,
             nodes=self._nodes,
             qnodes=self._qnodes,
+            beta_cutoffs=self._beta_cutoffs,
+            killer_first_searches=self._killer_first_searches,
+            history_ordered_moves=self._history_ordered_moves,
             elapsed_ms=self._elapsed_ms(started_ns),
             timed_out=False,
         )
@@ -312,7 +340,7 @@ class SearchEngine:
         best_move: chess.Move | None = None
         best_score = -INFINITY
         alpha = -INFINITY
-        for move in ordered_moves(board):
+        for move in self._ordered_search_moves(board, 0):
             board.push(move)
             try:
                 score = -self._negamax(board, depth - 1, -INFINITY, -alpha, 1)
@@ -343,7 +371,13 @@ class SearchEngine:
             return evaluate(board)
 
         best_score = -INFINITY
-        for move in ordered_moves(board):
+        for move in self._ordered_search_moves(board, ply_from_root):
+            quiet = not board.is_capture(move) and move.promotion is None
+            if self._use_move_heuristics and quiet:
+                if self._killer_rank(ply_from_root, move) is not None:
+                    self._killer_first_searches += 1
+                elif self._history_score(board.turn, move) > 0:
+                    self._history_ordered_moves += 1
             board.push(move)
             try:
                 score = -self._negamax(
@@ -358,8 +392,69 @@ class SearchEngine:
             best_score = max(best_score, score)
             alpha = max(alpha, score)
             if alpha >= beta:
+                self._beta_cutoffs += 1
+                if self._use_move_heuristics and quiet:
+                    self._record_quiet_cutoff(board, move, depth, ply_from_root)
                 break
         return best_score
+
+    def _ordered_search_moves(self, board: chess.Board, ply_from_root: int) -> list[chess.Move]:
+        """Order normal-search moves without changing qsearch's tactical move ordering."""
+        if not self._use_move_heuristics:
+            return ordered_moves(board)
+
+        def order_key(move: chess.Move) -> tuple[int, int, int, str]:
+            tactical_score = move_order_score(board, move)
+            if tactical_score > 0:
+                return (0, -tactical_score, 0, move.uci())
+            killer_rank = self._killer_rank(ply_from_root, move)
+            if killer_rank is not None:
+                return (1, killer_rank, 0, move.uci())
+            return (2, 0, -self._history_score(board.turn, move), move.uci())
+
+        return sorted(board.legal_moves, key=order_key)
+
+    def _record_quiet_cutoff(
+        self,
+        board: chess.Board,
+        move: chess.Move,
+        depth: int,
+        ply_from_root: int,
+    ) -> None:
+        """Record a quiet beta-cutoff move in the per-search killer and history tables."""
+        if board.is_capture(move) or move.promotion is not None:
+            return
+
+        killers = self._killers.setdefault(ply_from_root, [])
+        if move in killers:
+            killers.remove(move)
+        killers.insert(0, move)
+        del killers[MAX_KILLERS_PER_PLY:]
+
+        key = self._history_key(board.turn, move)
+        bonus = depth * depth
+        self._history[key] = min(HISTORY_MAX, self._history.get(key, 0) + bonus)
+
+    def _killer_rank(self, ply_from_root: int, move: chess.Move) -> int | None:
+        killers = self._killers.get(ply_from_root, [])
+        try:
+            return killers.index(move)
+        except ValueError:
+            return None
+
+    def _history_score(self, color: chess.Color, move: chess.Move) -> int:
+        return self._history.get(self._history_key(color, move), 0)
+
+    @staticmethod
+    def _history_key(color: chess.Color, move: chess.Move) -> HistoryKey:
+        return (color, move.from_square, move.to_square)
+
+    def _reset_search_heuristics(self) -> None:
+        self._beta_cutoffs = 0
+        self._killer_first_searches = 0
+        self._history_ordered_moves = 0
+        self._killers = {}
+        self._history = {}
 
     def _qsearch(
         self,

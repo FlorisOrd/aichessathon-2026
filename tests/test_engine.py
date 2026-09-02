@@ -4,6 +4,7 @@ import chess
 
 import agent
 from engine import (
+    HISTORY_MAX,
     INFINITY,
     MATE_SCORE,
     SearchEngine,
@@ -56,6 +57,84 @@ class SearchTests(unittest.TestCase):
         second = SearchEngine().search_fixed_depth(chess.Board(), 2)
         self.assertEqual(first.move, second.move)
         self.assertEqual(first.score, second.score)
+
+    def test_killer_insertion_prioritizes_the_latest_quiet_cutoff(self) -> None:
+        board = chess.Board()
+        engine = SearchEngine()
+        move = chess.Move.from_uci("g1f3")
+        engine._record_quiet_cutoff(board, move, depth=3, ply_from_root=2)
+        self.assertEqual(engine._killers[2], [move])
+
+    def test_capture_is_not_stored_as_a_killer_or_in_history(self) -> None:
+        board = chess.Board("k7/8/8/8/8/3p4/2P5/4K3 w - - 0 1")
+        engine = SearchEngine()
+        capture = chess.Move.from_uci("c2d3")
+        self.assertTrue(board.is_capture(capture))
+        engine._record_quiet_cutoff(board, capture, depth=4, ply_from_root=1)
+        self.assertNotIn(1, engine._killers)
+        self.assertEqual(engine._history_score(board.turn, capture), 0)
+
+    def test_promotion_is_not_stored_as_a_killer_or_in_history(self) -> None:
+        board = chess.Board("8/P6k/8/8/8/8/8/4K3 w - - 0 1")
+        engine = SearchEngine()
+        promotion = chess.Move.from_uci("a7a8q")
+        engine._record_quiet_cutoff(board, promotion, depth=4, ply_from_root=1)
+        self.assertNotIn(1, engine._killers)
+        self.assertEqual(engine._history_score(board.turn, promotion), 0)
+
+    def test_two_killer_replacement_is_deterministic(self) -> None:
+        board = chess.Board()
+        engine = SearchEngine()
+        first = chess.Move.from_uci("g1f3")
+        second = chess.Move.from_uci("b1c3")
+        third = chess.Move.from_uci("e2e4")
+        for move in (first, second, third):
+            engine._record_quiet_cutoff(board, move, depth=2, ply_from_root=3)
+        self.assertEqual(engine._killers[3], [third, second])
+        engine._record_quiet_cutoff(board, second, depth=2, ply_from_root=3)
+        self.assertEqual(engine._killers[3], [second, third])
+
+    def test_history_bonus_is_depth_weighted_and_bounded(self) -> None:
+        board = chess.Board()
+        engine = SearchEngine()
+        move = chess.Move.from_uci("g1f3")
+        engine._record_quiet_cutoff(board, move, depth=2, ply_from_root=1)
+        engine._record_quiet_cutoff(board, move, depth=3, ply_from_root=1)
+        self.assertEqual(engine._history_score(board.turn, move), 13)
+        engine._record_quiet_cutoff(board, move, depth=2_000, ply_from_root=1)
+        self.assertEqual(engine._history_score(board.turn, move), HISTORY_MAX)
+
+    def test_heuristics_reset_for_each_root_search(self) -> None:
+        board = chess.Board()
+        engine = SearchEngine()
+        move = chess.Move.from_uci("g1f3")
+        engine._record_quiet_cutoff(board, move, depth=3, ply_from_root=2)
+        engine.search(board, 0)
+        self.assertEqual(engine._killers, {})
+        self.assertEqual(engine._history, {})
+
+    def test_normal_order_is_tactical_then_killer_then_history_and_deterministic(self) -> None:
+        board = chess.Board("k7/4P3/8/8/8/3p4/2P5/4K3 w - - 0 1")
+        engine = SearchEngine()
+        killer = chess.Move.from_uci("e1f1")
+        historical = chess.Move.from_uci("e1d1")
+        engine._record_quiet_cutoff(board, killer, depth=2, ply_from_root=0)
+        engine._record_quiet_cutoff(board, historical, depth=1, ply_from_root=1)
+        first = engine._ordered_search_moves(board, 0)
+        second = engine._ordered_search_moves(board, 0)
+        tactical_count = sum(move_order_score(board, move) > 0 for move in first)
+        self.assertEqual(first, second)
+        self.assertTrue(all(move_order_score(board, move) > 0 for move in first[:tactical_count]))
+        self.assertEqual(first[tactical_count], killer)
+        self.assertEqual(first[tactical_count + 1], historical)
+
+    def test_fixed_depth_heuristics_change_nodes_not_qsearch_score(self) -> None:
+        board = chess.Board()
+        baseline = SearchEngine(use_move_heuristics=False).search_fixed_depth(board, 3)
+        ordered = SearchEngine().search_fixed_depth(board, 3)
+        self.assertEqual(ordered.score, baseline.score)
+        self.assertNotEqual(ordered.nodes, baseline.nodes)
+        self.assertEqual(board.fen(), chess.STARTING_FEN)
 
     def test_mate_in_one_is_selected(self) -> None:
         board = chess.Board("7k/5Q2/6K1/8/8/8/8/8 w - - 0 1")
