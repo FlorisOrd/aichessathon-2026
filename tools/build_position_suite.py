@@ -13,6 +13,7 @@ from collections import Counter, defaultdict
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import ExitStack, closing
 from dataclasses import asdict, dataclass
+from itertools import islice
 from pathlib import Path
 from statistics import median
 from typing import Any, BinaryIO, Literal, cast
@@ -61,8 +62,11 @@ class PositionCandidate:
 
 @dataclass(frozen=True)
 class StreamSummary:
+    record_start: int
+    record_end: int
     records_examined: int
     eligible_unique_positions: int
+    scanned_jsonl_bytes: int
     scanned_jsonl_sha256: str
     rejection_counts: dict[str, int]
     eligible_by_bucket: dict[str, int]
@@ -73,6 +77,12 @@ class BuiltSuites:
     development: list[PositionCandidate]
     holdout: list[PositionCandidate]
     fast: list[PositionCandidate]
+    stream: StreamSummary
+
+
+@dataclass(frozen=True)
+class SampledWindow:
+    reservoirs: dict[Bucket, list[PositionCandidate]]
     stream: StreamSummary
 
 
@@ -93,6 +103,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--source", default=SOURCE_URL, help="JSONL or JSONL.zst path/URL.")
     parser.add_argument("--source-date", default=SOURCE_DUMP_DATE)
+    parser.add_argument(
+        "--start-record",
+        type=int,
+        default=1,
+        help="One-based first non-empty JSONL record to include (default: 1).",
+    )
     parser.add_argument("--records", type=int, default=SOURCE_RECORD_LIMIT)
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--output-directory", type=Path, default=POSITIONS_DIRECTORY)
@@ -229,12 +245,17 @@ def bucket_name(bucket: Bucket) -> str:
     return f"{phase}|{side}|capture={str(capture).lower()}|castling={str(castling).lower()}"
 
 
-def build_suites(
+def sample_window(
     records: Iterator[tuple[int, bytes]],
     *,
+    record_start: int,
     record_limit: int,
     seed: int,
-) -> BuiltSuites:
+    unique_pawn_structures: bool = False,
+) -> SampledWindow:
+    """Reservoir-sample one already-sliced source window into the fixed strata."""
+    if record_start < 1:
+        raise SuiteBuildError("record start must be positive")
     if record_limit < 1:
         raise SuiteBuildError("record limit must be positive")
 
@@ -243,14 +264,21 @@ def build_suites(
     eligible_by_bucket: Counter[Bucket] = Counter()
     rejections: Counter[str] = Counter()
     seen_positions: set[str] = set()
+    seen_pawn_structures: set[str] = set()
     scanned_hash = hashlib.sha256()
+    scanned_bytes = 0
     records_examined = 0
+    first_record_number: int | None = None
+    last_record_number: int | None = None
 
     for record_number, raw_line in records:
         if records_examined >= record_limit:
             break
         records_examined += 1
+        first_record_number = first_record_number or record_number
+        last_record_number = record_number
         scanned_hash.update(raw_line)
+        scanned_bytes += len(raw_line)
         try:
             value = json.loads(raw_line)
             if not isinstance(value, dict):
@@ -265,6 +293,10 @@ def build_suites(
             rejections["duplicate position"] += 1
             continue
         seen_positions.add(position_key)
+        if unique_pawn_structures and candidate.pawn_structure_sha256 in seen_pawn_structures:
+            rejections["duplicate pawn structure"] += 1
+            continue
+        seen_pawn_structures.add(candidate.pawn_structure_sha256)
 
         bucket = bucket_for(candidate)
         eligible_by_bucket[bucket] += 1
@@ -282,6 +314,13 @@ def build_suites(
         raise SuiteBuildError(
             f"source ended after {records_examined:,} records; expected {record_limit:,}"
         )
+    expected_record_end = record_start + record_limit - 1
+    if first_record_number != record_start or last_record_number != expected_record_end:
+        raise SuiteBuildError(
+            "source iterator does not match requested record window: "
+            f"saw {first_record_number}..{last_record_number}; "
+            f"expected {record_start}..{expected_record_end}"
+        )
 
     underfilled = {
         bucket_name(bucket): (len(reservoirs[bucket]), bucket_quota(bucket))
@@ -291,11 +330,42 @@ def build_suites(
     if underfilled:
         raise SuiteBuildError(f"source window underfilled selection buckets: {underfilled}")
 
+    stream = StreamSummary(
+        record_start=record_start,
+        record_end=record_start + records_examined - 1,
+        records_examined=records_examined,
+        eligible_unique_positions=sum(eligible_by_bucket.values()),
+        scanned_jsonl_bytes=scanned_bytes,
+        scanned_jsonl_sha256=scanned_hash.hexdigest(),
+        rejection_counts=dict(sorted(rejections.items())),
+        eligible_by_bucket={
+            bucket_name(bucket): eligible_by_bucket[bucket] for bucket in all_buckets()
+        },
+    )
+    return SampledWindow(reservoirs=reservoirs, stream=stream)
+
+
+def build_suites(
+    records: Iterator[tuple[int, bytes]],
+    *,
+    record_limit: int,
+    seed: int,
+    record_start: int = 1,
+) -> BuiltSuites:
+    """Build the legacy 64/32 suites from an explicit one-based source window."""
+    window_records = islice(records, record_start - 1, record_start - 1 + record_limit)
+    sampled = sample_window(
+        window_records,
+        record_start=record_start,
+        record_limit=record_limit,
+        seed=seed,
+    )
+
     development: list[PositionCandidate] = []
     holdout: list[PositionCandidate] = []
     split_rng = random.Random(seed ^ 0x5A17_2026)
     for bucket in all_buckets():
-        selected = list(reservoirs[bucket])
+        selected = list(sampled.reservoirs[bucket])
         split_rng.shuffle(selected)
         development_count = bucket_quota(bucket) * 2 // 3
         development.extend(selected[:development_count])
@@ -304,16 +374,32 @@ def build_suites(
     split_rng.shuffle(holdout)
 
     fast = fast_subset(development, seed)
-    stream = StreamSummary(
-        records_examined=records_examined,
-        eligible_unique_positions=sum(eligible_by_bucket.values()),
-        scanned_jsonl_sha256=scanned_hash.hexdigest(),
-        rejection_counts=dict(sorted(rejections.items())),
-        eligible_by_bucket={
-            bucket_name(bucket): eligible_by_bucket[bucket] for bucket in all_buckets()
-        },
+    return BuiltSuites(
+        development=development,
+        holdout=holdout,
+        fast=fast,
+        stream=sampled.stream,
     )
-    return BuiltSuites(development=development, holdout=holdout, fast=fast, stream=stream)
+
+
+def build_promotion_positions(
+    records: Iterator[tuple[int, bytes]],
+    *,
+    record_start: int,
+    record_limit: int,
+    seed: int,
+) -> tuple[list[PositionCandidate], StreamSummary]:
+    """Build one 96-position promotion suite with unique pawn structures."""
+    sampled = sample_window(
+        records,
+        record_start=record_start,
+        record_limit=record_limit,
+        seed=seed,
+        unique_pawn_structures=True,
+    )
+    positions = [position for bucket in all_buckets() for position in sampled.reservoirs[bucket]]
+    random.Random(seed ^ 0xA11C_E096).shuffle(positions)
+    return positions, sampled.stream
 
 
 def fast_subset(development: Sequence[PositionCandidate], seed: int) -> list[PositionCandidate]:
@@ -359,9 +445,12 @@ def iter_jsonl(source: str, stack: ExitStack) -> Iterator[tuple[int, bytes]]:
         stream = raw
 
     buffered = stack.enter_context(io.BufferedReader(cast(io.RawIOBase, stream)))
-    for number, raw_line in enumerate(buffered, start=1):
-        if raw_line.strip():
-            yield number, raw_line
+    number = 0
+    for raw_line in buffered:
+        if not raw_line.strip():
+            continue
+        number += 1
+        yield number, raw_line
 
 
 def suite_content(positions: Sequence[PositionCandidate]) -> bytes:
@@ -404,6 +493,7 @@ def write_outputs(
     source_date: str,
     record_limit: int,
     seed: int,
+    record_start: int = 1,
 ) -> dict[str, object]:
     output_directory.mkdir(parents=True, exist_ok=True)
     paths = {
@@ -430,12 +520,18 @@ def write_outputs(
             "database_dump_date": source_date,
             "license": "CC0",
             "evaluation_source": "Stockfish evaluations contributed through Lichess analysis",
-            "selection_scope": f"first {record_limit} non-empty JSONL records",
+            "selection_scope": (
+                f"non-empty JSONL records {record_start} through "
+                f"{record_start + record_limit - 1} inclusive"
+            ),
+            "scanned_jsonl_bytes": built.stream.scanned_jsonl_bytes,
             "scanned_jsonl_sha256": built.stream.scanned_jsonl_sha256,
         },
         "selection": {
             "seed": seed,
             "method": "per-stratum reservoir sampling followed by deterministic 2:1 splitting",
+            "record_start": record_start,
+            "record_end": record_start + record_limit - 1,
             "record_limit": record_limit,
             "criteria": {
                 "variant": "valid standard chess",
@@ -529,11 +625,17 @@ def print_report(metadata: Mapping[str, object]) -> None:
 def main() -> None:
     arguments = build_parser().parse_args()
     records = cast(int, arguments.records)
+    record_start = cast(int, arguments.start_record)
     source = cast(str, arguments.source)
     seed = cast(int, arguments.seed)
     try:
         with ExitStack() as stack:
-            built = build_suites(iter_jsonl(source, stack), record_limit=records, seed=seed)
+            built = build_suites(
+                iter_jsonl(source, stack),
+                record_limit=records,
+                seed=seed,
+                record_start=record_start,
+            )
         metadata = write_outputs(
             built,
             output_directory=cast(Path, arguments.output_directory),
@@ -541,6 +643,7 @@ def main() -> None:
             source_date=cast(str, arguments.source_date),
             record_limit=records,
             seed=seed,
+            record_start=record_start,
         )
     except (OSError, SuiteBuildError, urllib.error.URLError) as error:
         raise SystemExit(f"error: {error}") from error

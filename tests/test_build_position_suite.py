@@ -12,6 +12,7 @@ from tools.build_position_suite import (
     PositionCandidate,
     all_buckets,
     bucket_quota,
+    build_promotion_positions,
     build_suites,
     candidate_from_record,
     iter_jsonl,
@@ -132,6 +133,69 @@ class ReservoirTests(unittest.TestCase):
         self.assertEqual(
             sum(item.capture_available for item in first.development),
             32,
+        )
+
+    def test_explicit_start_record_selects_exact_window(self) -> None:
+        candidates: dict[int, PositionCandidate] = {}
+        for bucket in all_buckets():
+            for _ in range(bucket_quota(bucket)):
+                source_record = len(candidates) + 6
+                candidates[source_record] = make_candidate(source_record, bucket)
+        raw_records = [
+            (index, (json.dumps({"index": index}) + "\n").encode())
+            for index in range(1, len(candidates) + 6)
+        ]
+
+        def parsed(record: object, source_record: int) -> PositionCandidate:
+            del record
+            return candidates[source_record]
+
+        with patch("tools.build_position_suite.candidate_from_record", side_effect=parsed):
+            built = build_suites(
+                iter(raw_records),
+                record_start=6,
+                record_limit=len(candidates),
+                seed=2026,
+            )
+
+        self.assertEqual(built.stream.record_start, 6)
+        self.assertEqual(built.stream.record_end, len(candidates) + 5)
+        self.assertEqual(built.stream.records_examined, len(candidates))
+        self.assertTrue(
+            all(position.source_record >= 6 for position in built.development + built.holdout)
+        )
+
+    def test_promotion_sampling_is_deterministic_and_balanced(self) -> None:
+        candidates: list[PositionCandidate] = []
+        for bucket in all_buckets():
+            for _ in range(bucket_quota(bucket) + 2):
+                candidates.append(make_candidate(len(candidates) + 1, bucket))
+        raw_records = [
+            (index, (json.dumps({"index": index}) + "\n").encode())
+            for index in range(1, len(candidates) + 1)
+        ]
+
+        def parsed(record: object, source_record: int) -> PositionCandidate:
+            del record
+            return candidates[source_record - 1]
+
+        with patch("tools.build_position_suite.candidate_from_record", side_effect=parsed):
+            first, first_stream = build_promotion_positions(
+                iter(raw_records), record_start=1, record_limit=len(raw_records), seed=2026
+            )
+            second, second_stream = build_promotion_positions(
+                iter(raw_records), record_start=1, record_limit=len(raw_records), seed=2026
+            )
+
+        self.assertEqual(first, second)
+        self.assertEqual(first_stream, second_stream)
+        self.assertEqual(len(first), 96)
+        self.assertEqual(len({item.pawn_structure_sha256 for item in first}), 96)
+        self.assertEqual(sum(item.side_to_move == "white" for item in first), 48)
+        self.assertEqual(sum(item.capture_available for item in first), 48)
+        self.assertEqual(
+            {phase: sum(item.category == phase for item in first) for phase in PHASE_TOTALS},
+            dict(PHASE_TOTALS),
         )
 
     def test_plain_jsonl_stream_can_be_kept_outside_repository(self) -> None:
