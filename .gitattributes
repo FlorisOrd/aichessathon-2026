@@ -1,3 +1,6 @@
 benchmarks/positions/development-64.fens text eol=lf
 benchmarks/positions/development-fast-16.fens text eol=lf
 benchmarks/positions/holdout-32.fens text eol=lf
+benchmarks/positions/promotion-a-96.fens text eol=lf
+benchmarks/positions/promotion-b-96.fens text eol=lf
+benchmarks/positions/promotion-c-96.fens text eol=lf
