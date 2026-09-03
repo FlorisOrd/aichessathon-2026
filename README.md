@@ -1,112 +1,109 @@
-# AI Chessathon starter
+# AI Chessathon 2026 Agent
 
-Fork this to build an agent for [AI Chessathon](https://aichessathon.com). It gives you a working
-submission, baselines to beat, and a local harness that speaks the same protocol and enforces the
-same clock as the platform, so you can see whether a change actually helped before you upload it.
+**A deterministic chess agent with time-managed search and reproducible evaluation.**
 
-```
-git clone https://github.com/advitrocks9/aichessathon-starter
-cd aichessathon-starter
-make setup
-make play
-```
+This repository is an active competition-development project built on the upstream [AI Chessathon starter](https://github.com/advitrocks9/aichessathon-starter). The current candidate replaces the starter's random mover with a deterministic search engine and adds controlled evaluation tooling. No competition ranking, Elo estimate or uncommitted benchmark result is claimed here.
 
-That plays your agent against a baseline over a full 120 s + 0.5 s game and prints the result.
-When you like it, `make zip` and drop `submission.zip` on your dashboard.
+## Upstream starter and repository-specific work
 
-## Writing an agent
+The upstream starter provides the platform-compatible `get_move` contract, process sandbox, referee and clock handling, local play and arena harnesses, baseline agents, packaging flow and Make targets. Those components retain their original attribution and [MIT licence](LICENSE).
 
-`agent.py` is the whole submission. One function:
+Work developed in this repository includes:
+
+- `agent.py`, which calls the candidate engine and returns a deterministic legal fallback if search fails or time is too low.
+- `engine.py`, implementing iterative-deepening negamax, alpha-beta pruning, deterministic move ordering, quiescence search and a tapered material/piece-square evaluation.
+- Conservative soft and hard time budgets that preserve a clock reserve and return the last completed search iteration.
+- Reproducible paired-position experiments through `tools.arena_suite`, including reversed colours, fixed seeds, explicit time controls, position-suite hashes and optional JSON or PGN records.
+- Fixed development and holdout FEN suites with documented provenance and usage policy.
+
+The upstream `harness/` referee remains authoritative for local match rules and legality.
+
+## Agent contract
+
+The platform imports `agent.py` and calls:
 
 ```python
 def get_move(fen: str, time_left_ms: int) -> str:
     return "e2e4"
 ```
 
-The fork ships a legal random-mover, so the loop works before you write anything. Replace the body.
+The current implementation parses the FEN with `python-chess`, searches from the side to move and returns a legal move in UCI notation.
 
+## Set up and play
+
+```bash
+git clone https://github.com/FlorisOrd/aichessathon-2026.git
+cd aichessathon-2026
+make setup
+make play
 ```
-make play                                          # one game, real time control
-make arena                                         # 20 fast games, prints a score
-make play FEN="<fen>"                              # start from a given position
+
+Useful Make targets:
+
+```bash
+make play
+make arena
+make zip
+make gate
+```
+
+- `make play` runs one game against the greedy baseline.
+- `make arena` runs a 20-game local match against the greedy baseline.
+- `make zip` builds `submission.zip`.
+- `make gate` runs Ruff, mypy and a short harness match against the random baseline.
+
+Start from a specific position:
+
+```bash
+make play FEN="<fen>"
+```
+
+Run a single game with explicit sides and save the PGN:
+
+```bash
 uv run python -m harness.play --black baselines/minimax --pgn game.pgn
+```
+
+Run a larger local match:
+
+```bash
 uv run python -m harness.arena --opponent ../my-old-version --games 200
 ```
 
-Anything your agent writes to stdout or stderr shows up under the result, so `print` debugging
-works. The platform discards it during rated games and shows it in your validation log.
+CI runs the quality gate on Ubuntu and a short harness match on macOS and Windows.
 
-## The ladder
+## Reproducible evaluation
 
-Measured with `harness/arena.py`. Beating greedy is a search. Beating minimax is a search plus an
-evaluation worth searching with.
-
-| Matchup | Games | Time control | Score |
-|---|---|---|---|
-| random vs greedy | 20 | 10 s + 0.1 s | 10.0% (+1 =2 -17) |
-| greedy vs minimax | 6 | 120 s + 0.5 s | 0.0% (+0 =0 -6) |
-| numba vs minimax | 6 | 10 s + 0.5 s | 66.7% (+2 =4 -0) |
-
-- `baselines/random` plays a uniformly random legal move. It is what `agent.py` starts as.
-- `baselines/greedy` searches one ply on material.
-- `baselines/minimax` searches two plies on material and mobility, with no time management.
-- `baselines/numba` is `minimax` with the evaluation jitted. It is barely stronger, which is
-  the point: jitting a shallow search buys headroom, not depth. Read it for the warm-up call
-  at the bottom, which is how you keep compilation off your clock.
-
-## What's here
-
-```
-agent.py             your submission
-baselines/           random, greedy, minimax, numba; each is a directory with an agent.py
-harness/runner.py    the process the platform runs your agent in
-harness/referee.py   the clock, legality, draw and adjudication rules
-harness/rules.py     the event constants the harness enforces
-harness/sandbox.py   the one process, spoken to as the platform speaks to a container
-harness/play.py      one game between two agent directories
-harness/arena.py     many games, with a score
-harness/package.py   builds submission.zip with agent.py at the root
-docs/IDEAS.md        where the strength actually comes from
-```
-
-Local games start from the normal position unless you pass `--fen`. Rated games start from
-curated neutral positions.
-
-The harness is here so your games are honest, not so you can pre-validate an upload. Acceptance
-happens on the platform, and the validation log on your dashboard is the authority on it.
-
-## Reproducible benchmarks
-
-`tools.arena_suite` compares a candidate with any local opponent directory over a FEN suite. Each
-position is played twice with colors reversed, which controls for color and starting-position
-bias. The official `harness/` referee remains authoritative and must not be changed.
+`tools.arena_suite` compares two local agent directories across a FEN suite. Each position is played twice with colours reversed to control for colour and starting-position effects.
 
 Fast candidate-versus-baseline smoke run from PowerShell:
 
-```
+```powershell
 uv run python -m tools.arena_suite --agent . --opponent baselines/greedy `
   --json-output benchmarks/results/smoke.json --pgn-output benchmarks/results/smoke.pgn
 ```
 
-For candidate-versus-champion testing, pass their Git worktree directories to `--agent` and
-`--opponent`. Competition-clock example:
+Candidate-versus-champion example:
 
-```
+```powershell
 uv run python -m tools.arena_suite --agent C:\worktrees\candidate `
   --opponent C:\worktrees\champion --repeats 10 --shuffle --seed 2026 `
   --base-ms 120000 --increment-ms 500 --ply-cap 300 `
   --json-output benchmarks/results/competition.json
 ```
 
-The bundled smoke FENs are used by default. JSON is written only when `--json-output` is supplied;
-generated files under `benchmarks/results/` are ignored. PGN output is optional and separate. Runs
-normally record all scheduled games before exiting with status 2 if an agent failed; add
-`--fail-fast` to stop after the first crash, illegal move, flag, init failure, or `both_failed`.
+The runner normally completes the planned schedule before returning exit status `2` when an agent fails. Add `--fail-fast` to stop after the first crash, illegal move, flag, initialization failure or `both_failed`.
 
-The fixed Phase 2 development and holdout position sets, their deterministic generator, provenance,
-and holdout-use policy are documented in [`docs/BENCHMARK_SUITES.md`](docs/BENCHMARK_SUITES.md).
+See [fixed benchmark suites](docs/BENCHMARK_SUITES.md) for provenance, regeneration and the separation between development and holdout positions. The general starter guidance remains available in [Where the strength comes from](docs/IDEAS.md).
 
-## The rules
+## Current status and limitations
 
-[aichessathon.com/docs](https://aichessathon.com/docs) is canonical and changes. Read it before
-you upload.
+- Search order and evaluation are deterministic; wall-clock timing can affect the last completed depth, but playing strength is not asserted without committed, traceable experiment records.
+- The engine has no transposition table or external chess engine integration.
+- A root FEN contains a halfmove clock but not the full earlier repetition history; the engine does not invent unavailable game history.
+- Generated benchmark JSON and PGN files are local artefacts unless deliberately committed with their provenance and reproduction command.
+- Platform rules and upload validation remain authoritative. Consult the current [AI Chessathon documentation](https://aichessathon.com/docs) before submission.
+
+## My role and development approach
+
+I owned the architecture, experiment design, task decomposition, testing, benchmark decisions and coordination of coding agents. Claude-assisted changes were evaluated through tests and controlled comparisons rather than accepted solely because they appeared plausible.
