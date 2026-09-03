@@ -1,8 +1,8 @@
 """Simple deterministic reference engine built on python-chess.
 
 Evaluation scores are integer centipawns from the side-to-move perspective. Search uses
-iterative-deepening negamax with alpha-beta pruning. FEN contains the halfmove clock but not the
-game's earlier positions, so fifty-move claims can be represented while pre-root repetition
+iterative-deepening negamax with Principal Variation Search. FEN contains the halfmove clock but
+not the game's earlier positions, so fifty-move claims can be represented while pre-root repetition
 history cannot; this engine deliberately does not invent missing repetition state.
 """
 
@@ -82,6 +82,8 @@ class SearchResult:
     beta_cutoffs: int
     killer_first_searches: int
     history_ordered_moves: int
+    pvs_null_window_searches: int
+    pvs_researches: int
     elapsed_ms: float
     timed_out: bool
 
@@ -220,16 +222,20 @@ class SearchEngine:
         *,
         use_quiescence: bool = True,
         use_move_heuristics: bool = True,
+        use_pvs: bool = True,
     ) -> None:
         self._clock_ns = clock_ns
         self._use_quiescence = use_quiescence
         self._use_move_heuristics = use_move_heuristics
+        self._use_pvs = use_pvs
         self._deadline_ns: int | None = None
         self._nodes = 0
         self._qnodes = 0
         self._beta_cutoffs = 0
         self._killer_first_searches = 0
         self._history_ordered_moves = 0
+        self._pvs_null_window_searches = 0
+        self._pvs_researches = 0
         self._killers: dict[int, list[chess.Move]] = {}
         self._history: dict[HistoryKey, int] = {}
 
@@ -250,6 +256,8 @@ class SearchEngine:
                 beta_cutoffs=0,
                 killer_first_searches=0,
                 history_ordered_moves=0,
+                pvs_null_window_searches=0,
+                pvs_researches=0,
                 elapsed_ms=self._elapsed_ms(started_ns),
                 timed_out=False,
             )
@@ -271,6 +279,8 @@ class SearchEngine:
                 beta_cutoffs=0,
                 killer_first_searches=0,
                 history_ordered_moves=0,
+                pvs_null_window_searches=0,
+                pvs_researches=0,
                 elapsed_ms=self._elapsed_ms(started_ns),
                 timed_out=False,
             )
@@ -304,6 +314,8 @@ class SearchEngine:
             beta_cutoffs=self._beta_cutoffs,
             killer_first_searches=self._killer_first_searches,
             history_ordered_moves=self._history_ordered_moves,
+            pvs_null_window_searches=self._pvs_null_window_searches,
+            pvs_researches=self._pvs_researches,
             elapsed_ms=self._elapsed_ms(started_ns),
             timed_out=timed_out,
         )
@@ -327,6 +339,8 @@ class SearchEngine:
             beta_cutoffs=self._beta_cutoffs,
             killer_first_searches=self._killer_first_searches,
             history_ordered_moves=self._history_ordered_moves,
+            pvs_null_window_searches=self._pvs_null_window_searches,
+            pvs_researches=self._pvs_researches,
             elapsed_ms=self._elapsed_ms(started_ns),
             timed_out=False,
         )
@@ -340,10 +354,12 @@ class SearchEngine:
         best_move: chess.Move | None = None
         best_score = -INFINITY
         alpha = -INFINITY
-        for move in self._ordered_search_moves(board, 0):
+        for move_index, move in enumerate(self._ordered_search_moves(board, 0)):
             board.push(move)
             try:
-                score = -self._negamax(board, depth - 1, -INFINITY, -alpha, 1)
+                score = self._search_child(
+                    board, depth - 1, alpha, INFINITY, 1, first=move_index == 0
+                )
             finally:
                 board.pop()
             if score > best_score:
@@ -371,7 +387,7 @@ class SearchEngine:
             return evaluate(board)
 
         best_score = -INFINITY
-        for move in self._ordered_search_moves(board, ply_from_root):
+        for move_index, move in enumerate(self._ordered_search_moves(board, ply_from_root)):
             quiet = not board.is_capture(move) and move.promotion is None
             if self._use_move_heuristics and quiet:
                 if self._killer_rank(ply_from_root, move) is not None:
@@ -380,12 +396,13 @@ class SearchEngine:
                     self._history_ordered_moves += 1
             board.push(move)
             try:
-                score = -self._negamax(
+                score = self._search_child(
                     board,
                     depth - 1,
-                    -beta,
-                    -alpha,
+                    alpha,
+                    beta,
                     ply_from_root + 1,
+                    first=move_index == 0,
                 )
             finally:
                 board.pop()
@@ -397,6 +414,30 @@ class SearchEngine:
                     self._record_quiet_cutoff(board, move, depth, ply_from_root)
                 break
         return best_score
+
+    def _search_child(
+        self,
+        board: chess.Board,
+        depth: int,
+        alpha: int,
+        beta: int,
+        ply_from_root: int,
+        *,
+        first: bool,
+    ) -> int:
+        """Search an already-pushed normal-search child, returning the parent's score.
+
+        A null-window fail-high at beta is enough to cut off. Only an improvement strictly
+        inside the parent's window needs a full-window re-search. Qsearch never calls here.
+        """
+        if first or not self._use_pvs:
+            return -self._negamax(board, depth, -beta, -alpha, ply_from_root)
+        self._pvs_null_window_searches += 1
+        score = -self._negamax(board, depth, -alpha - 1, -alpha, ply_from_root)
+        if alpha < score < beta:
+            self._pvs_researches += 1
+            score = -self._negamax(board, depth, -beta, -alpha, ply_from_root)
+        return score
 
     def _ordered_search_moves(self, board: chess.Board, ply_from_root: int) -> list[chess.Move]:
         """Order normal-search moves without changing qsearch's tactical move ordering."""
@@ -453,6 +494,8 @@ class SearchEngine:
         self._beta_cutoffs = 0
         self._killer_first_searches = 0
         self._history_ordered_moves = 0
+        self._pvs_null_window_searches = 0
+        self._pvs_researches = 0
         self._killers = {}
         self._history = {}
 
