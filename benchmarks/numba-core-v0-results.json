@@ -1,0 +1,122 @@
+{
+  "compile_warmup_seconds": 11.869118399999934,
+  "corpus": {
+    "development_positions": 64,
+    "legal_move_transitions_checked": 64861,
+    "random_positions": 2048,
+    "random_seed": 20260903,
+    "sha256": "73dcac0389670d63d01d2e4676a606036cef0e78c14fb7e2dbf445b82cbf886a",
+    "smoke_positions": 4,
+    "total_positions": 2116
+  },
+  "environment": {
+    "numba": "0.67.0",
+    "numpy": "2.5.2",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "python": "3.12.14 (main, Aug 25 2026, 14:01:42) [MSC v.1944 64 bit (AMD64)]",
+    "python_chess": "1.11.2"
+  },
+  "schema": "aichessathon.numba-core-v0-results",
+  "schema_version": 1,
+  "throughput": {
+    "make_unmake": {
+      "corpus_positions": 2116,
+      "make_unmake_round_trips": 648610,
+      "numba": {
+        "elapsed_seconds": 0.6158990999997513,
+        "round_trips_per_second": 1053110.8098717174
+      },
+      "python_chess": {
+        "elapsed_seconds": 4.4104260000003705,
+        "round_trips_per_second": 147062.89143042997
+      },
+      "repeats": 10,
+      "speedup": 7.160955422734261
+    },
+    "move_generation": {
+      "corpus_positions": 2116,
+      "legal_moves_generated": 1621525,
+      "numba": {
+        "elapsed_seconds": 0.21436640000001717,
+        "legal_moves_per_second": 7564268.467445785,
+        "positions_per_second": 246773.74812468636
+      },
+      "python_chess": {
+        "elapsed_seconds": 2.897933500000363,
+        "legal_moves_per_second": 559545.2759698582,
+        "positions_per_second": 18254.387134830173
+      },
+      "repeats": 25,
+      "speedup": 13.518599463349345
+    }
+  },
+  "validation": {
+    "mismatch_count": 0,
+    "mismatch_examples": [],
+    "perft": {
+      "endgame": {
+        "depth": 3,
+        "expected_nodes": 2812,
+        "numba_nodes": 2812,
+        "passed": true,
+        "python_chess_nodes": 2812
+      },
+      "kiwipete": {
+        "depth": 3,
+        "expected_nodes": 97862,
+        "numba_nodes": 97862,
+        "passed": true,
+        "python_chess_nodes": 97862
+      },
+      "start": {
+        "depth": 4,
+        "expected_nodes": 197281,
+        "numba_nodes": 197281,
+        "passed": true,
+        "python_chess_nodes": 197281
+      }
+    },
+    "special_cases": {
+      "black_kingside_and_queenside_castling": {
+        "mismatches": [],
+        "passed": true
+      },
+      "checkmate": {
+        "mismatches": [],
+        "passed": true
+      },
+      "discovered_check": {
+        "mismatches": [],
+        "passed": true
+      },
+      "double_check": {
+        "mismatches": [],
+        "passed": true
+      },
+      "double_pawn_moves": {
+        "mismatches": [],
+        "passed": true
+      },
+      "en_passant": {
+        "mismatches": [],
+        "passed": true
+      },
+      "pinned_piece": {
+        "mismatches": [],
+        "passed": true
+      },
+      "promotions_and_underpromotions": {
+        "mismatches": [],
+        "passed": true
+      },
+      "stalemate": {
+        "mismatches": [],
+        "passed": true
+      },
+      "white_kingside_and_queenside_castling": {
+        "mismatches": [],
+        "passed": true
+      }
+    }
+  }
+}
