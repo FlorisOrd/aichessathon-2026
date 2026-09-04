@@ -1,12 +1,15 @@
-"""Competition entrypoint for the deterministic reference engine."""
+"""Competition entrypoint for the parity-validated Numba killer/history speed port."""
 
 import traceback
 
 import chess
 
-from engine import SearchEngine, ordered_moves
+from engine import ordered_moves
+from numba_engine import SearchEngine, warmup
 
+WARMUP_SECONDS = warmup()
 ENGINE = SearchEngine()
+print(f"engine_init_warmup_seconds={WARMUP_SECONDS:.3f}", flush=True)
 
 
 def get_move(fen: str, time_left_ms: int) -> str:

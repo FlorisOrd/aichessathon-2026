@@ -1,0 +1,29 @@
+{
+  "compressed_bytes": 14138,
+  "uncompressed_bytes": 56235,
+  "cap_bytes": 50000000,
+  "manifest": [
+    {
+      "path": "agent.py",
+      "bytes": 1491,
+      "sha256": "8ec02a406fbb84eedf6c26b769ef96f2860ebd33aa91d638d11ffb4425967900"
+    },
+    {
+      "path": "engine.py",
+      "bytes": 18680,
+      "sha256": "4dd13bc455d8843c61cfa47c40067adc9ea187e8b2d7083bab7c37efefadb8c4"
+    },
+    {
+      "path": "numba_core.py",
+      "bytes": 20717,
+      "sha256": "0e507ff81f2b9e87f104a471b06d35e75595386498842ba66b79ed12365ff084"
+    },
+    {
+      "path": "numba_engine.py",
+      "bytes": 15347,
+      "sha256": "fd34825f5d02fbd9f1e34ede6c37821672fcd336fe91766e7d7d773c268d51eb"
+    }
+  ],
+  "packaged_smoke_passed": true,
+  "log": "engine_init_warmup_seconds=15.267\nmove=b1c3 depth=4 score=0 nodes=1468 qnodes=6724 cutoffs=1195 killer_first=1405 history_moves=377 elapsed_ms=40.1 timeout=yes\nPACKAGE_OK\n"
+}

@@ -34,4 +34,4 @@ ignore = ["N818"]
 
 [tool.mypy]
 strict = true
-files = ["agent.py", "engine.py", "numba_core.py", "harness", "tests", "tools"]
+files = ["agent.py", "engine.py", "numba_core.py", "numba_engine.py", "harness", "tests", "tools"]

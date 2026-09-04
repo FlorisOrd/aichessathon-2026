@@ -1,0 +1,32 @@
+[
+  {
+    "cold_import_seconds": 15.460922599995683,
+    "no_new_signatures": true,
+    "moves": [
+      "b1c3",
+      "a7a8q",
+      "e1d1"
+    ],
+    "peak_working_set_bytes": 214274048
+  },
+  {
+    "cold_import_seconds": 16.336421399995743,
+    "no_new_signatures": true,
+    "moves": [
+      "b1c3",
+      "a7a8q",
+      "e1d1"
+    ],
+    "peak_working_set_bytes": 214511616
+  },
+  {
+    "cold_import_seconds": 15.618772099995113,
+    "no_new_signatures": true,
+    "moves": [
+      "b1c3",
+      "a7a8q",
+      "e1d1"
+    ],
+    "peak_working_set_bytes": 216047616
+  }
+]
